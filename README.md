@@ -1,5 +1,16 @@
 # Alexus
 
+**Don't take the AI's word for it.**
+
+Two claims, each one shown in `demo/run-demo`:
+
+1. **Alexus runs the checklist itself.** When the AI says "done", Alexus runs the checks. If one fails, the AI is sent back. A run is only marked proved when every check passed, run by Alexus, not by the AI.
+2. **If anyone edits a receipt afterward, Alexus names the line.** Every step is written to a hash-chained log by Alexus, not by the AI.
+
+What it does not claim: someone with full control of the machine can rewrite the whole log. Keep the head hash somewhere else (`verify --head`), and you'll catch that too.
+
+Works with the Claude Code, Grok, and Codex CLIs. No keys stored. Your own AI accounts.
+
 This program starts a Claude Code, Grok, or Codex session in a folder and keeps a live state file for that run. When a run is in proved mode, it does not trust the agent's own "done": it runs the checklist commands itself.
 
 Alexus, by Ragnarok. "Don't ship probably. Ship provably."

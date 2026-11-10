@@ -255,6 +255,17 @@ def main():
     if rec.returncode != 0:
         sys.stdout.write(rec.stderr or "")
 
+    pause("Every time the runner ran a check itself, in order:")
+    try:
+        for line in (Path(arh) / "agents" / rid / "receipts.jsonl").read_text(encoding="utf-8").splitlines():
+            r = json.loads(line)
+            d = r.get("data") or {}
+            if r.get("type") == "check" or ("passed" in d and "claim" in d):
+                print("  receipt #%-3s %-9s %s  (exit %s)" % (r.get("seq"), "PASSED" if d.get("passed") else "FAILED",
+                                                            d.get("claim"), d.get("exit_code")))
+    except (OSError, ValueError):
+        pass
+
     pause("verify should report the chain intact.")
     v = run_ar(["verify", rid], env)
     sys.stdout.write(v.stdout or "")
