@@ -1,0 +1,1786 @@
+"""The planner. You say what you want; a planner says it back and writes the checklist.
+
+The worker does not write its own exam. This program reuses bin/alexus's checklist
+parser and sandboxed check runner. It does not copy them.
+
+  alexus plan new --cwd DIR [--who claude|grok|codex] [--model M] [--name N] "task"
+  alexus plan revise ID [--who claude|grok|codex] [--model M] "change"
+  alexus plan create --cwd DIR --name N --checklist FILE [--walls FILE] "task"
+  alexus plan edit ID [--checklist FILE] [--task-file FILE] [--name N] [--walls FILE|--no-walls]
+  alexus plan list [--json]
+  alexus plan show ID
+  alexus plan start ID [--who claude|grok|codex] [--model M]
+  alexus plan precheck --cwd DIR FILE
+  alexus plan selfcheck
+
+Saved plans: $ALEXUS_HOME/plans/<id>/  (default ~/.alexus/runner/plans)
+  PLAN.md       the plan in plain words, including any past failures the planner saw
+  checklist.md  the checklist `start` freezes
+  plan.json     the saved record
+
+Codex is the one planner with a provider read-only mode (its own sandbox flag). It is not
+placed inside another sandbox, so that flag can apply. Claude and Grok have no such mode:
+they plan inside a throwaway copy of the folder, and the prompt names that copy, not the real
+folder. When a sandbox profile can be applied, their process is also denied writes to the real
+folder. This program does not change the folder's permissions. That is a copy, not a claim
+that those CLIs are read-only.
+
+A check that already passes before any work is flagged "already true, proves nothing".
+Walls use this program's wall lines. They are kept only if you leave them in the plan.
+Enforced walls run on Claude only and turn handoff off.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PLANNER_TOOLS = "Read,Grep,Glob,Bash,WebSearch,WebFetch"
+WALLS_LIMIT = "these walls only run on Claude and turn handoff off"
+PAST_LIMIT = 1500
+PLAN_TIMEOUT = 600
+_AGENT = None
+_SANDBOX_OK = None
+
+# Loaded by the planner process. Refuses writes under the real task folder. Not a provider read-only mode.
+# Callables are objects, not functions: pathlib stores os.open on a class, and a function would bind
+# and shift the arguments (Python 3.9 raises TypeError on every write).
+_WRITE_GUARD = r'''
+import builtins
+import io
+import os
+_real = os.path.realpath(os.environ.get("ALEXUS_PLAN_REAL", "") or "")
+
+def _under(path):
+    if not _real or isinstance(path, int):
+        return False
+    try:
+        p = os.path.realpath(os.fspath(path))
+    except Exception:
+        return False
+    return p == _real or p.startswith(_real + os.sep)
+
+def _deny(path):
+    try:
+        shown = os.fspath(path)
+    except Exception:
+        shown = str(path)
+    raise PermissionError(13, "Permission denied", shown)
+
+_bopen = builtins.open
+class _TextOpen:
+    def __call__(self, file, mode="r", *a, **k):
+        m = mode if isinstance(mode, str) else ""
+        if any(c in m for c in "wax+") and _under(file):
+            _deny(file)
+        return _bopen(file, mode, *a, **k)
+
+builtins.open = _TextOpen()
+io.open = builtins.open
+
+_osopen = os.open
+class _OsOpen:
+    def __call__(self, path, flags, mode=0o777, *a, **k):
+        bits = 0
+        for name in ("O_WRONLY", "O_RDWR", "O_APPEND", "O_CREAT", "O_TRUNC"):
+            bits |= getattr(os, name, 0)
+        if isinstance(flags, int) and (flags & bits) and _under(path):
+            _deny(path)
+        return _osopen(path, flags, mode, *a, **k)
+
+os.open = _OsOpen()
+
+class _Unary:
+    def __init__(self, fn):
+        self.fn = fn
+    def __call__(self, path, *a, **k):
+        if _under(path):
+            _deny(path)
+        return self.fn(path, *a, **k)
+
+for _name in ("chmod", "lchmod", "chflags", "remove", "unlink", "mkdir", "rmdir", "makedirs", "truncate"):
+    _fn = getattr(os, _name, None)
+    if _fn is not None:
+        setattr(os, _name, _Unary(_fn))
+
+class _Binary:
+    def __init__(self, fn):
+        self.fn = fn
+    def __call__(self, src, dst, *a, **k):
+        if _under(src) or _under(dst):
+            _deny(dst)
+        return self.fn(src, dst, *a, **k)
+
+for _name in ("rename", "replace", "link", "symlink"):
+    _fn = getattr(os, _name, None)
+    if _fn is not None:
+        setattr(os, _name, _Binary(_fn))
+'''
+
+# Path bits and tiny words that would match every temp folder or every sentence.
+PAST_STOP = frozenset("""
+this that with from your have will when what into over only then than them they were been
+also just about after before would could should there their which where while tmp temp
+private folders users home developer applications application library support agent runner alexus
+true false none null file files test tests plan self check work code bin var
+""".split())
+
+
+def agent_mod():
+    """bin/alexus holds the one checklist grammar and the sandboxed check runner."""
+    global _AGENT
+    if _AGENT is not None:
+        return _AGENT
+    path = str(HERE / "alexus")
+    loader = importlib.machinery.SourceFileLoader("alexus_mod", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("alexus_mod", loader))
+    loader.exec_module(mod)
+    _AGENT = mod
+    return mod
+
+
+def planner_guide(owner):
+    who = owner if owner and owner != "you" else "you"
+    return f"""You are the planner. You are talking with {who} before any work starts. You do NOT do the task.
+You are looking at a copy of the task folder. Change nothing: do not create, edit or delete files.
+Then answer in exactly this shape, plain English, short:
+
+UNDERSTOOD: <one or two sentences: what {who} wants, in your words>
+WILL: <what the worker will do>
+WONT: <what it will not do, or what is out of scope>
+WALLS:
+- <one wall per line, or the single word none>
+## Checklist
+- [ ] <what must be true when it is done> :: verify: <shell command that exits 0 only when it is true>
+
+Wall lines use the runner's wall form: no-network, read-only, write-only: paths, app-only: App,
+deny: regex, once: regex, no-tool: ToolA, ToolB, or a plain sentence. Leave WALLS as none when
+nothing must be blocked. Enforced walls run on Claude only and turn handoff off; say so by using
+those wall forms, not by picking a provider.
+
+Checklist rules:
+- 2 to 8 lines. Each command must FAIL now (before the work) and pass only when the work is really done.
+  Make it strict enough that empty or fake work fails: check contents, counts, exact values, not just that a file exists.
+- Optional  :: expect: <regex>  when the output must match something.
+- Commands run later in the task folder, with writes outside temp folders blocked, no ssh/scp/rsync, 120 s each.
+  Prove things on this computer: files, git, test, grep, jq, curl to a URL.
+- Write every path, in checks and in walls, relative to the task folder, which is the current directory.
+  Do not use an absolute path. The copy in front of you is deleted when you finish, and a path into it cannot work later.
+- Use  :: verify: HUMAN  only for what only {who} can judge (taste, "is this the right one", something on another device).
+  Keep those few.
+- Anything that spends money, deletes things, sends messages outside, or changes accounts: say so under WONT unless
+  {who} clearly asked for it, and give it a HUMAN line.
+If {who} asks for a change, give the whole answer again in the same shape."""
+
+
+def parse_plan(text):
+    """Pull UNDERSTOOD / WILL / WONT / WALLS / the checklist out of a planner reply."""
+    names = r"UNDERSTOOD|WILL|WONT|WON'T|WALLS"
+
+    def field(name):
+        m = re.search(rf"^\s*{name}:\s*(.+?)(?=^\s*(?:{names}):|^\s*## Checklist|\Z)", text or "", re.M | re.S)
+        return " ".join(m.group(1).split()) if m else ""
+
+    walls = []
+    m = re.search(r"^\s*WALLS:\s*(.*?)(?=^\s*## Checklist|\Z)", text or "", re.M | re.S)
+    if m:
+        body = m.group(1).strip()
+        if body.lower() != "none":
+            for line in body.splitlines():
+                line = re.sub(r"^\s*[-*]\s*", "", line).strip()
+                if line and line.lower() != "none":
+                    walls.append(line)
+    ck = ""
+    m = re.search(r"^\s*## Checklist\s*$(.*)", text or "", re.M | re.S)
+    if m:
+        ck = "\n".join(l.strip() for l in m.group(1).splitlines() if l.strip().startswith("- ["))
+    return {"understood": field("UNDERSTOOD"), "will": field("WILL"),
+            "wont": field("WONT") or field("WON'T"), "walls": walls, "checklist": ck}
+
+
+def flag_steps(steps):
+    """A check that already passes, before any work, proves nothing about the work."""
+    for s in steps:
+        if s.get("ok") is True:
+            s["proves_nothing"] = True
+            s["note"] = "already true, proves nothing"
+        else:
+            s["proves_nothing"] = False
+    return steps
+
+
+def precheck(cwd, checklist_text):
+    a = agent_mod()
+    steps = a.parse_checklist(checklist_text)
+    with tempfile.TemporaryDirectory(prefix="alexus-plan-") as d:
+        a.run_checks(Path(d), cwd, steps)
+    return flag_steps(steps)
+
+
+def parsed_walls(lines):
+    a = agent_mod()
+    out = []
+    for line in lines or []:
+        text = " ".join(str(line).split())
+        if not text or text.lower() == "none":
+            continue
+        out.append(a.parse_wall(text))
+    return out
+
+
+def keywords(text):
+    words = re.findall(r"[a-z0-9]{4,}", (text or "").lower())
+    return {w for w in words if w not in PAST_STOP}
+
+
+# The account segment of /Users/<name> or /home/<name>. Two folders under one login are not a match.
+_ACCOUNT_DIR = re.compile(r"^/(?:users|home)/([a-z0-9][a-z0-9._-]{0,63})(?=/|$)", re.I)
+# One shared word is a coincidence. Two task words, or the same folder name, is a match.
+_MIN_WORD_OVERLAP = 2
+
+
+def folder_leaf(cwd):
+    """The folder's own name. A parent such as Projects is not a match between its children."""
+    text = (cwd or "").replace("\\", "/").rstrip("/")
+    if not text:
+        return ""
+    m = _ACCOUNT_DIR.match(text)
+    if m:
+        text = text[m.end():].strip("/")
+    leaf = text.rsplit("/", 1)[-1].lower()
+    if leaf in PAST_STOP or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{3,}", leaf or ""):
+        return ""
+    return leaf
+
+
+def _finished(st):
+    if not isinstance(st, dict) or not str(st.get("task") or "").strip():
+        return False
+    if st.get("status") in ("starting", "running"):
+        return False
+    return bool(st.get("ended") or st.get("verdict") or st.get("status") in ("done", "failed", "stopped"))
+
+
+def _is_failure(st):
+    """A run that worked is not a past failure, and must not take a slot from one."""
+    if not _finished(st):
+        return False
+    verdict = str(st.get("verdict") or "").strip().lower()
+    if verdict in ("proved", "needs you"):
+        return False
+    # A plain run has no verdict. Finishing normally is not a failure.
+    return bool(verdict) or st.get("status") != "done"
+
+
+# This text goes to a planner, maybe another provider, and is saved on the plan.
+_SECRET_TEXT = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
+                          r"|\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}"
+                          r"|xai-[A-Za-z0-9]{16,})", re.S)
+
+
+def _snippet(st):
+    lines = [f"Asked: {st.get('task') or ''}"]
+    lines.append(f"Verdict: {st.get('verdict') or st.get('status') or ''}")
+    fails = []
+    for c in st.get("checks") or []:
+        if isinstance(c, dict) and c.get("ok") is False and c.get("claim"):
+            fails.append(str(c["claim"]))
+    if fails:
+        lines.append("Failed checks: " + "; ".join(fails))
+    crit = st.get("critic") if isinstance(st.get("critic"), dict) else {}
+    refs = [str(x).strip() for x in (crit.get("refuted") or []) if str(x).strip()]
+    if refs:
+        lines.append("Critic: " + "; ".join(refs))
+    return _SECRET_TEXT.sub("[removed]", "\n".join(lines))
+
+
+def past_failures(request, cwd, limit=3, char_limit=PAST_LIMIT):
+    """Up to 3 failed runs from this install. No network. Empty when nothing really matches.
+
+    A match needs two shared task words, or the same folder name. One word is not enough.
+    A parent directory is not the folder name. A proved run is left out.
+    """
+    a = agent_mod()
+    query = keywords(request)
+    leaf = folder_leaf(cwd)
+    if not query and not leaf:
+        return ""
+    root = a.agents_dir()
+    if not root.is_dir():
+        return ""
+    hits = []
+    for d in root.iterdir():
+        if not d.is_dir() or d.name.startswith(".") or d.is_symlink():
+            continue
+        st = a.load(d)
+        try:
+            if not _is_failure(st):
+                continue
+            words = len(query & keywords(str(st.get("task") or "")))
+            same = bool(leaf) and leaf == folder_leaf(str(st.get("cwd") or ""))
+            if words < _MIN_WORD_OVERLAP and not same:
+                continue
+            hits.append((words + (2 if same else 0), str(st.get("ended") or ""), _snippet(st)))
+        except (AttributeError, TypeError, ValueError):
+            continue    # one damaged run must not stop planning
+    if not hits:
+        return ""
+    hits.sort(key=lambda h: (h[0], h[1]), reverse=True)
+    parts = [h[2] for h in hits[:limit]]
+    sep = "\n---\n"
+    while True:
+        text = sep.join(parts)
+        if len(text) <= char_limit:
+            return text
+        i = max(range(len(parts)), key=lambda k: len(parts[k]))
+        if len(parts[i]) <= 40:
+            return text[:char_limit].rstrip()
+        parts[i] = parts[i][:len(parts[i]) - 40].rstrip()
+
+
+def throwaway_copy(real, base):
+    """Same copy the critic uses, then a normal copy if the clone is not available."""
+    a = agent_mod()
+    try:
+        work = a.critic_copy(real, base)
+    except Exception:
+        work = None
+    if work and os.path.isdir(work):
+        return work
+    dest = Path(base) / "copy"
+    try:
+        shutil.copytree(real, dest, symlinks=True)
+    except Exception:
+        return None
+    return str(dest)
+
+
+def _deny_profile(real):
+    # Last matching rule wins. Deny the real folder after the default allow, even when it sits under a temp dir.
+    return "(version 1)\n(allow default)\n(deny file-write* (subpath " + json.dumps(os.path.realpath(real)) + "))\n"
+
+
+def _sandbox_can_apply():
+    """False when this process is already sandboxed and a second profile cannot be applied."""
+    global _SANDBOX_OK
+    if _SANDBOX_OK is not None:
+        return _SANDBOX_OK
+    sb = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
+    if not (os.path.isfile(sb) and os.access(sb, os.X_OK)):
+        _SANDBOX_OK = False
+        return False
+    try:
+        r = subprocess.run([sb, "-p", "(version 1) (allow default)", "/usr/bin/true"],
+                           capture_output=True, text=True, timeout=5)
+        _SANDBOX_OK = r.returncode == 0
+    except Exception:
+        _SANDBOX_OK = False
+    return _SANDBOX_OK
+
+
+def _sandbox_refused(proc):
+    """True when sandbox-exec could not apply a profile, so the planner CLI never started."""
+    err = proc.stderr or ""
+    return proc.returncode != 0 and "sandbox_apply" in err and "Operation not permitted" in err
+
+
+def _guard_env(base, real, env):
+    """Point the planner process at a write guard. Does not change the real folder."""
+    guard = Path(base) / "guard"
+    guard.mkdir(exist_ok=True)
+    (guard / "sitecustomize.py").write_text(_WRITE_GUARD)
+    prev = env.get("PYTHONPATH") or ""
+    env["PYTHONPATH"] = str(guard) + (os.pathsep + prev if prev else "")
+    env["ALEXUS_PLAN_REAL"] = os.path.realpath(real)
+    return env
+
+
+def planner_cmd(who, prompt, guide, model, cwd):
+    """Argv for one planner call. Only Codex gets a provider read-only flag."""
+    a = agent_mod()
+    binary = a.cli_bin(who)
+    if who == "codex":
+        cmd = [binary, "exec", "--json", "--sandbox", "read-only", "--skip-git-repo-check", "--cd", cwd]
+        if model:
+            cmd += ["--model", model]
+        return cmd + [guide + "\n\n" + prompt], True, "read-only sandbox"
+    if who == "grok":
+        cmd = [binary, "--cwd", cwd, "-p", prompt, "--output-format", "streaming-messages-json",
+               "--always-approve", "--no-plan", "--rules", guide, "--disallowed-tools", a.GROK_OFF]
+        if model:
+            cmd += ["--model", model]
+        return cmd, False, "throwaway copy"
+    if who == "muse":
+        full = guide + "\n\nTask: " + prompt
+        cmd = [binary, "exec", "--json", "--yolo", "--disable-request-user-input", "--workspace", cwd, full]
+        if model:
+            cmd = cmd[:-1] + ["--model", model, cmd[-1]]
+        return cmd, False, "throwaway copy"
+    cmd = [binary, "-p", prompt, "--output-format", "stream-json", "--verbose",
+           "--permission-mode", "auto", "--append-system-prompt", guide, "--tools", PLANNER_TOOLS]
+    if model:
+        cmd += ["--model", model]
+    return cmd, False, "throwaway copy"
+
+
+def texts_from_output(stdout):
+    texts, session, cost = [], None, None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "thread.started" and e.get("thread_id"):
+            session = e.get("thread_id")
+        item = e.get("item") or {}
+        if e.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
+            if item.get("text"):
+                texts.append(item["text"])
+        if e.get("type") == "assistant":
+            for c in (e.get("message") or {}).get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
+                    texts.append(c["text"])
+        if e.get("type") == "result":
+            if e.get("session_id"):
+                session = e.get("session_id")
+            if e.get("total_cost_usd") is not None:
+                cost = e.get("total_cost_usd")
+            if e.get("result"):
+                texts.append(e["result"])
+        if e.get("type") == "text" and e.get("data"):
+            texts.append(e["data"])
+        if e.get("type") == "end" and e.get("sessionId"):
+            session = e.get("sessionId")
+    if not texts and (stdout or "").strip():
+        texts = [stdout]
+    return texts, session, cost
+
+
+def user_prompt(folder, text, past):
+    parts = [f"Task folder: {folder}", ""]
+    if past:
+        parts += ["PAST FAILURES (from earlier runs on this install):", past, ""]
+    parts += ["What you were asked:", text]
+    return "\n".join(parts)
+
+
+def _strip_copy_path(text, work):
+    """Turn the copy's absolute path into a path relative to the task folder."""
+    if not text or not work:
+        return text
+    forms = []
+    seen = set()
+    for raw in (str(work), os.path.realpath(work)):
+        raw = (raw or "").rstrip("/")
+        if not raw or raw in seen or raw == "/":
+            continue
+        seen.add(raw)
+        forms.append(raw)
+        alt = raw[len("/private"):] if raw.startswith("/private/") else "/private" + raw
+        alt = alt.rstrip("/")
+        if alt and alt not in seen and alt != "/":
+            seen.add(alt)
+            forms.append(alt)
+    forms.sort(key=len, reverse=True)
+    for root in forms:
+        text = text.replace(root + "/", "")
+        text = text.replace(root, ".")
+    return text
+
+
+def _prompt_for_work(prompt, real, work):
+    """Name the folder the planner is actually in. A copy must not be labeled with the real path.
+
+    The critic does the same: it is shown the copy, so a write to the path it was given
+    cannot land in the real folder when a sandbox profile cannot be applied.
+    """
+    real_s = os.path.realpath(real)
+    work_s = os.path.realpath(work)
+    if work_s == real_s:
+        return prompt
+    prefix = f"Task folder: {real_s}"
+    if prompt.startswith(prefix):
+        return f"Task folder: {work_s}" + prompt[len(prefix):]
+    return prompt
+
+
+def _child_env():
+    """Environment for the planner process. The real folder path is not included."""
+    env = dict(os.environ, NO_COLOR="1", TERM="dumb")
+    env.pop("CLAUDECODE", None)
+    env.pop("ALEXUS_PLAN_REAL", None)
+    return env
+
+
+def provider_order(cfg):
+    a = agent_mod()
+    order = []
+    for w in [cfg.get("default_who")] + list(cfg.get("clis") or []) + list(cfg.get("handoff") or []):
+        if not w:
+            continue
+        try:
+            n = a.normalize_who(w)
+        except SystemExit:
+            continue
+        if n not in order:
+            order.append(n)
+    return order or ["claude"]
+
+
+def ask_one(who, real, prompt, model):
+    """Run one provider against a copy when it has no read-only mode. Never writes the real folder."""
+    a = agent_mod()
+    guide = planner_guide(a.owner_name())
+    base = Path(tempfile.mkdtemp(prefix="alexus-plan-"))
+    try:
+        work = throwaway_copy(real, str(base))
+        if not work:
+            if who != "codex":
+                return {"ok": False, "who": who, "planner_read_only": False, "planner_isolation": "throwaway copy",
+                        "error": "could not copy the folder, so the planner did not run"}
+            work = real
+        # The prompt that arrived names the real folder. Once a copy exists, show the copy instead.
+        prompt = _prompt_for_work(prompt, real, work)
+        cmd, read_only, isolation = planner_cmd(who, prompt, guide, model, work)
+        # Codex's own flag is the read-only mode. An outer seatbelt would stop that flag from applying.
+        if who != "codex":
+            read_only = False
+            isolation = "throwaway copy"
+        bare = cmd
+        env = _child_env()
+        run_env = env
+        # Codex is not wrapped. Claude and Grok are, only when a profile can be applied.
+        # The real path is handed to the child only inside that profile, which denies writes to it.
+        if who != "codex" and _sandbox_can_apply():
+            prof = base / "deny.sb"
+            prof.write_text(_deny_profile(real))
+            sb = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
+            cmd = [sb, "-f", str(prof), "--", *bare]
+            run_env = _child_env()
+            _guard_env(base, real, run_env)
+        try:
+            r = subprocess.run(cmd, cwd=work, capture_output=True, text=True, env=run_env, timeout=PLAN_TIMEOUT,
+                               stdin=subprocess.DEVNULL)
+        except Exception as e:
+            return {"ok": False, "who": who, "planner_read_only": read_only, "planner_isolation": isolation,
+                    "error": f"could not run the planner: {e}"}
+        if cmd is not bare and _sandbox_refused(r):
+            # The profile did not apply. Retry with no real path in the environment.
+            try:
+                r = subprocess.run(bare, cwd=work, capture_output=True, text=True, env=env, timeout=PLAN_TIMEOUT,
+                                   stdin=subprocess.DEVNULL)
+            except Exception as e:
+                return {"ok": False, "who": who, "planner_read_only": read_only, "planner_isolation": isolation,
+                        "error": f"could not run the planner: {e}"}
+        texts, sess, cost = texts_from_output(r.stdout)
+        if not texts:
+            return {"ok": False, "who": who, "planner_read_only": read_only, "planner_isolation": isolation,
+                    "error": a.one(r.stderr or r.stdout or f"planner exited {r.returncode}", 600)}
+        text = next((t for t in reversed(texts) if re.search(r"^\s*## Checklist", t, re.M)), texts[-1])
+        plan = parse_plan(text)
+        # The copy is deleted after this call. A check or wall that names it would be frozen on a dead path.
+        for key in ("understood", "will", "wont", "checklist"):
+            plan[key] = _strip_copy_path(plan.get(key), work)
+        plan["walls"] = [_strip_copy_path(w, work) for w in plan.get("walls") or []]
+        plan.update(who=who, session=sess, cost_usd=cost, raw=text,
+                    planner_read_only=read_only, planner_isolation=isolation)
+        return plan
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def ask(cwd, text, model=None, who=None, past=None):
+    a = agent_mod()
+    cfg = a.load_config() or {}
+    whos = [a.normalize_who(who)] if who else provider_order(cfg)
+    if past is None:
+        past = past_failures(text, cwd)
+    prompt = user_prompt(os.path.realpath(cwd), text, past)
+    last = {"ok": False, "error": "no planner is configured"}
+    for w in whos:
+        # A model name belongs to one provider. The next one in the order uses its own default.
+        last = ask_one(w, os.path.realpath(cwd), prompt, model if w == whos[0] else None)
+        last["past"] = past or ""
+        if past:
+            last["past"] = past
+        else:
+            last.pop("past", None)
+        steps = precheck(cwd, last.get("checklist") or "") if last.get("checklist") else []
+        last["steps"] = steps
+        last["walls"] = parsed_walls(last.get("walls") or [])
+        if not any(not s.get("human") for s in steps):
+            last.update(ok=False, error=last.get("error") or "the planner wrote no checklist line with a command; ask it again or revise")
+        else:
+            last["ok"] = True
+            return last
+    return last
+
+
+# ------------------------------------------------------------------ saved plans
+def plans_dir():
+    return agent_mod().runner_home() / "plans"
+
+
+def stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def new_id(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "plan").lower()).strip("-")[:40] or "plan"
+    return time.strftime("%Y%m%d-%H%M%S-") + slug + "-" + uuid.uuid4().hex[:4]
+
+
+def plan_path(pid):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}", str(pid or "")):
+        return None
+    root = plans_dir()
+    d = root / pid
+    if d.parent != root:
+        return None
+    return d
+
+
+def load_plan(pid):
+    d = plan_path(pid)
+    if d is None:
+        return None
+    try:
+        return json.loads((d / "plan.json").read_text())
+    except Exception:
+        return None
+
+
+def task_text(rec):
+    a = agent_mod()
+    asks = rec.get("asks") or []
+    if not asks:
+        return rec.get("task") or ""
+    if len(asks) == 1:
+        return asks[0]
+    who = a.owner_name()
+    return asks[0] + f"\n\n{who} then added:\n" + "\n".join("- " + x for x in asks[1:])
+
+
+def plan_md(rec):
+    """Everything the worker needs. Past failures are in this file, not a side channel."""
+    steps = rec.get("steps") or []
+    lines = [f"# Plan: {rec.get('name')}", "",
+             f"Folder: {rec.get('cwd')}  ·  saved {rec.get('updated')}  ·  plan id {rec.get('id')}"
+             + (f"  ·  planner: {rec.get('who')}" if rec.get("who") else "")
+             + (f"  ·  runs: {', '.join(rec['runs'])}" if rec.get("runs") else ""), ""]
+    if rec.get("who") == "codex":
+        lines += ["Codex ran in its read-only sandbox.", ""]
+    elif rec.get("who"):
+        lines += ["The planner looked at a throwaway copy of the folder and did not change it.", ""]
+    lines += ["## What you asked", "", task_text(rec), ""]
+    for k, h in (("understood", "Understood"), ("will", "Will"), ("wont", "Won't")):
+        if rec.get(k):
+            lines += [f"## {h}", "", rec[k], ""]
+    walls = rec.get("walls") or []
+    if walls:
+        lines += ["## Walls", ""]
+        for w in walls:
+            mark = "enforced" if w.get("enforced") else "not machine-enforced"
+            lines.append(f"- {w.get('text')} ({mark})")
+        lines.append("")
+        if any(w.get("enforced") for w in walls):
+            lines += [WALLS_LIMIT, ""]
+    lines += ["## Checklist", "", "Done means every command line exits 0. HUMAN lines are for "
+              + agent_mod().owner_name() + ".", "", (rec.get("checklist") or "").strip(), ""]
+    already = [x.get("claim") for x in steps if x.get("proves_nothing") or x.get("ok") is True]
+    already = [x for x in already if x]
+    if already:
+        lines += ["Already true when the plan was saved (these prove nothing about the work): " + "; ".join(already), ""]
+    if rec.get("past"):
+        lines += ["## Past failures", "", rec["past"], ""]
+    lines += ["## How to run it", "",
+              f"From a shell: `alexus plan start {rec.get('id')}`.",
+              "The worker does the work in the folder above so every checklist line is true.", ""]
+    return "\n".join(lines)
+
+
+def save_plan(rec):
+    rec["updated"] = stamp()
+    d = plan_path(rec["id"])
+    if d is None:
+        raise ValueError("bad plan id")
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(plans_dir(), 0o700)
+    except OSError:
+        pass
+    clean = {k: v for k, v in rec.items() if k != "raw" and not (k == "past" and not v)}
+    if not clean.get("past"):
+        clean.pop("past", None)
+    clean["plan_md"] = str(d / "PLAN.md")
+    if _enforced(clean.get("walls")):
+        clean["walls_limit"] = WALLS_LIMIT
+    else:
+        clean.pop("walls_limit", None)
+    (d / "plan.json").write_text(json.dumps(clean, indent=1) + "\n")
+    (d / "checklist.md").write_text((rec.get("checklist") or "").strip() + "\n")
+    (d / "PLAN.md").write_text(plan_md(clean))
+    if rec.get("raw"):
+        with open(d / "planner.log", "a") as f:
+            f.write(f"\n===== {rec['updated']}\n{rec['raw']}\n")
+    return clean
+
+
+def all_plans():
+    root = plans_dir()
+    if not root.exists():
+        return []
+    out = []
+    for d in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True):
+        rec = load_plan(d.name)
+        if rec:
+            out.append(rec)
+    return out
+
+
+def _enforced(walls):
+    return [w for w in (walls or []) if isinstance(w, dict) and w.get("enforced")]
+
+
+def plan_model(rec, who):
+    """A saved model name belongs to the provider that planned. Another provider uses its own default."""
+    return rec.get("model") if (not rec.get("who") or rec.get("who") == who) else None
+
+
+def revise_request(rec, change):
+    """Every planner call gets a new copy, so an old conversation points at a folder that is gone.
+
+    The planner starts fresh and is handed the request and the plan so far.
+    """
+    walls = [f"- {w['text']}" for w in rec.get("walls") or [] if isinstance(w, dict) and w.get("text")] or ["none"]
+    earlier = [f"UNDERSTOOD: {rec.get('understood') or ''}", f"WILL: {rec.get('will') or ''}",
+               f"WONT: {rec.get('wont') or ''}", "WALLS:", *walls, "## Checklist", (rec.get("checklist") or "").strip()]
+    return "\n\n".join([task_text(rec), "The plan so far:\n" + "\n".join(earlier), "Change:\n" + change])
+
+
+def tell_next(plan):
+    """stdout stays JSON. This is the plain version for the person at the terminal."""
+    if not (plan.get("ok") and plan.get("id")):
+        return
+    lines = [f"Plan saved. Read it: {plan.get('plan_md')}"]
+    if plan.get("walls_limit"):
+        lines.append(plan["walls_limit"])
+    lines += [f"Change it: alexus plan revise {plan['id']} -- \"what to change\"",
+              f"Run it: alexus plan start {plan['id']}"]
+    print("\n".join(lines), file=sys.stderr)
+
+
+def start_plan(pid, model=None, who=None):
+    """Start the worker with the settings worker and handoff, unless enforced walls say otherwise."""
+    a = agent_mod()
+    cfg = a.require_config()
+    rec = load_plan(pid)
+    if not rec:
+        return None, f"no plan {pid}"
+    d = plan_path(pid)
+    ck_path = d / "checklist.md"
+    checklist = ck_path.read_text() if ck_path.is_file() else (rec.get("checklist") or "")
+    if not a.parse_checklist(checklist):
+        return None, "this plan has no checklist line with a command yet"
+    walls = rec.get("walls") or []
+    enforced = _enforced(walls)
+    if enforced:
+        if who and a.normalize_who(who) != "claude":
+            return None, WALLS_LIMIT
+        worker = "claude"
+        handoff = "none"
+    else:
+        worker = a.normalize_who(who) if who else a.normalize_who(
+            cfg.get("default_who") or (cfg.get("clis") or ["claude"])[0])
+        chain = [str(w) for w in (cfg.get("handoff") or []) if str(w).strip()]
+        handoff = ",".join(chain) if chain else "none"
+    cmd = [sys.executable, "-B", "-I", str(HERE / "alexus"), "start",
+           "--cwd", rec["cwd"], "--name", rec.get("name") or pid,
+           "--who", worker, "--checklist", str(ck_path)]
+    if handoff == "none":
+        cmd.append("--no-handoff")
+    else:
+        cmd += ["--handoff", handoff]
+    use_model = model or plan_model(rec, worker)
+    if use_model:
+        cmd += ["--model", use_model]
+    if walls:
+        outcome = rec.get("understood") or (rec.get("asks") or [""])[0] or rec.get("name") or "the agreed plan"
+        domain = {"outcome": outcome, "proof": [], "walls": [w.get("text") or "" for w in walls if w.get("text")]}
+        df = d / "domain.json"
+        df.write_text(json.dumps(domain) + "\n")
+        cmd += ["--domain", str(df)]
+    task = task_text(rec) + f"\n\nRead the plan first. It lists any past failures to avoid: {d / 'PLAN.md'}"
+    r = subprocess.run(cmd + ["--", task], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, (r.stderr or r.stdout).strip()
+    rid = r.stdout.strip().splitlines()[-1]
+    fresh = load_plan(pid) or rec
+    fresh.setdefault("runs", []).append(rid)
+    save_plan(fresh)
+    return rid, None
+
+
+def _take(it):
+    try:
+        return next(it)
+    except StopIteration:
+        sys.exit("alexus plan: missing a value for the last flag")
+
+
+def _wall_lines(path):
+    text = Path(os.path.expanduser(path)).read_text()
+    return [re.sub(r"^\s*[-*]\s*", "", ln).strip() for ln in text.splitlines() if ln.strip()]
+
+
+def selfcheck():
+    """Fake CLIs only. No model call. Prints one ok line per case."""
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        print(("ok  " if cond else "FAIL ") + name)
+        if not cond:
+            ok = False
+
+    home = Path(tempfile.mkdtemp(prefix="alexus-plan-sc-"))
+    state = home / "state"
+    work = home / "workbox"
+    bindir = home / "bin"
+    state.mkdir()
+    work.mkdir()
+    bindir.mkdir()
+    (work / "keep.txt").write_text("keep")
+    os.chmod(work, 0o1755)
+    os.chmod(work / "keep.txt", 0o644)
+    # Test-only: lets the fake stat the real folder during the call. The product does not set this.
+    os.environ["PLAN_SC_REAL"] = str(work.resolve())
+    os.environ["HOME"] = str(home)
+    os.environ["ALEXUS_HOME"] = str(state)
+    os.environ["ALEXUS_CRITICS"] = "claude"
+    os.environ["PATH"] = str(bindir) + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
+    for key in ("ALEXUS_CLAUDE", "ALEXUS_GROK", "ALEXUS_CODEX", "ALEXUS_MUSE"):
+        os.environ.pop(key, None)
+    agent_mod().write_config({"owner": "Ada", "clis": ["claude", "grok", "codex"],
+                              "default_who": "claude", "handoff": ["grok", "codex"]})
+
+    sample = """UNDERSTOOD: Make primes.txt.
+WILL: write the file.
+WONT: nothing else.
+WALLS:
+- no-network
+- be kind
+## Checklist
+- [ ] primes.txt lists five primes :: verify: test -f primes.txt
+- [ ] already true :: verify: true
+- [ ] looks right :: verify: HUMAN
+"""
+    parsed = parse_plan(sample)
+    walls = parsed_walls(parsed["walls"])
+    check("plan-parse", parsed["understood"] == "Make primes.txt." and parsed["wont"] == "nothing else."
+          and parsed["checklist"].count("- [ ]") == 3 and [w["kind"] for w in walls] == ["no-network", "text"]
+          and walls[0]["enforced"] is True and walls[1]["enforced"] is False)
+    steps = {s["claim"]: s for s in precheck(str(work), parsed["checklist"])}
+    already = steps.get("already true") or {}
+    missing = steps.get("primes.txt lists five primes") or {}
+    human = steps.get("looks right") or {}
+    check("plan-precheck-flags-already-true", already.get("ok") is True and already.get("proves_nothing") is True
+          and already.get("note") == "already true, proves nothing" and missing.get("ok") is False
+          and missing.get("proves_nothing") is False and human.get("ok") is None and human.get("proves_nothing") is False)
+    src = (HERE / "alexus-plan").read_text()
+    check("plan-timeout-600", PLAN_TIMEOUT == 600 and "timeout=PLAN_TIMEOUT" in src
+          and ("timeout=" + "90") not in src)
+
+    reply = sample.replace("WALLS:\n- no-network\n- be kind\n", "WALLS:\nnone\n")
+
+    def write_fake(who, body_lines):
+        path = bindir / who
+        path.write_text(body_lines)
+        path.chmod(0o755)
+        os.environ["ALEXUS_" + who.upper()] = str(path)
+        return path
+
+    def planner_body(who, document):
+        if who == "codex":
+            lines = [
+                json.dumps({"type": "thread.started", "thread_id": f"sess-{who}"}),
+                json.dumps({"type": "item.completed", "item": {"id": "m", "type": "agent_message", "text": document}}),
+                json.dumps({"type": "turn.completed"}),
+            ]
+        else:
+            lines = [
+                json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": document}]}}),
+                json.dumps({"type": "result", "result": "ok", "session_id": f"sess-{who}", "total_cost_usd": 0.01}),
+            ]
+        payload = "\n".join(lines) + "\n"
+        return (
+            "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, subprocess, sys\n"
+            f"who = {who!r}\n"
+            "home = os.environ.get('ALEXUS_HOME', '')\n"
+            "pathlib.Path(home, 'ran-' + who).write_text('yes')\n"
+            "pathlib.Path(home, 'argv-' + who).write_text(json.dumps(sys.argv))\n"
+            "try:\n"
+            "    parent = subprocess.check_output(['ps', '-o', 'command=', '-p', str(os.getppid())], text=True)\n"
+            "except Exception:\n"
+            "    parent = ''\n"
+            "pathlib.Path(home, 'parent-' + who).write_text(parent)\n"
+            "try:\n"
+            "    pathlib.Path('planner-must-not-write').write_text('rel')\n"
+            "except OSError:\n"
+            "    pass\n"
+            "blob = ' '.join(sys.argv)\n"
+            "marker = 'Task folder: '\n"
+            "i = blob.find(marker)\n"
+            "folder = blob[i + len(marker):].split()[0] if i >= 0 else ''\n"
+            "watch = os.environ.get('PLAN_SC_REAL') or folder\n"
+            "if watch:\n"
+            "    try:\n"
+            "        dmode = os.stat(watch).st_mode & 0o7777\n"
+            "        fmode = os.stat(os.path.join(watch, 'keep.txt')).st_mode & 0o7777\n"
+            "        pathlib.Path(home, 'modes-' + who).write_text('%d %d' % (dmode, fmode))\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "if folder:\n"
+            "    try:\n"
+            "        pathlib.Path(folder, 'planner-must-not-write').write_text('abs')\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "sys.stdout.write(" + repr(payload) + ")\n"
+        )
+
+    script = str(HERE / "alexus")
+    py = sys.executable
+
+    def run_cli(args, env=None, timeout=40):
+        return subprocess.run([py, "-B", "-I", script, "plan", *args], capture_output=True, text=True,
+                              timeout=timeout, env=env or os.environ.copy())
+
+    claude_id = None
+    for who in ("claude", "codex", "grok"):
+        for other in ("claude", "codex", "grok"):
+            for name in (f"ran-{other}", f"argv-{other}"):
+                p = state / name
+                if p.exists():
+                    p.unlink()
+        bad = work / "planner-must-not-write"
+        if bad.exists():
+            bad.unlink()
+        write_fake(who, planner_body(who, reply))
+        # The other two stay installed so a silent fallback would touch their marker.
+        for other in ("claude", "codex", "grok"):
+            if other != who and not (bindir / other).exists():
+                write_fake(other, planner_body(other, reply))
+        r = run_cli(["new", "--who", who, "--cwd", str(work), "--name", f"Marker {who}", "--", "add a marker file"])
+        data = {}
+        try:
+            data = json.loads(r.stdout or "{}")
+        except ValueError:
+            data = {}
+        argv = []
+        argv_path = state / f"argv-{who}"
+        if argv_path.is_file():
+            try:
+                argv = json.loads(argv_path.read_text())
+            except ValueError:
+                argv = []
+        ran_only = (state / f"ran-{who}").is_file() and not any(
+            (state / f"ran-{o}").is_file() for o in ("claude", "codex", "grok") if o != who)
+        good = (r.returncode == 0 and data.get("ok") is True and data.get("who") == who
+                and data.get("session") == f"sess-{who}" and ran_only)
+        if not good:
+            sys.stderr.write(f"plan-who-{who}: rc {r.returncode} out {r.stdout[:400]!r} err {r.stderr[:400]!r}\n")
+        check(f"plan-who-{who}", good)
+        untouched = (not bad.exists()) and (work / "keep.txt").read_text() == "keep"
+        if not untouched:
+            sys.stderr.write(f"plan-write-{who}: real folder changed\n")
+        check(f"plan-write-{who}", untouched)
+        if who == "codex":
+            try:
+                i = argv.index("--sandbox")
+                flagged = argv[i + 1] == "read-only"
+            except ValueError:
+                flagged = False
+            parent = (state / "parent-codex").read_text() if (state / "parent-codex").is_file() else ""
+            check("plan-codex-readonly", flagged and data.get("planner_read_only") is True
+                  and data.get("planner_isolation") == "read-only sandbox")
+            check("plan-codex-no-outer-sandbox", flagged and "sandbox-exec" not in parent)
+        elif who == "claude":
+            claude_id = data.get("id")
+            check("plan-claude-not-claimed-readonly", data.get("planner_read_only") is False
+                  and data.get("planner_isolation") == "throwaway copy" and "--sandbox" not in argv)
+        else:
+            check("plan-grok-not-claimed-readonly", data.get("planner_read_only") is False
+                  and data.get("planner_isolation") == "throwaway copy" and "--sandbox" not in argv)
+
+    sticky = True
+    for who in ("claude", "codex", "grok"):
+        raw = (state / f"modes-{who}").read_text().split() if (state / f"modes-{who}").is_file() else []
+        if len(raw) != 2 or int(raw[0]) != 0o1755 or int(raw[1]) != 0o644:
+            sticky = False
+            sys.stderr.write(f"plan-sticky {who}: during {raw}\n")
+    after_d = os.stat(work).st_mode & 0o7777
+    after_f = os.stat(work / "keep.txt").st_mode & 0o7777
+    check("plan-sticky-unchanged", sticky and after_d == 0o1755 and after_f == 0o644)
+
+    # Revise stays on the same provider. It starts fresh, with the plan so far in the prompt.
+    if claude_id:
+        (state / "argv-claude").unlink(missing_ok=True)
+        r = run_cli(["revise", claude_id, "--", "start the list at 2"])
+        argv = []
+        if (state / "argv-claude").is_file():
+            argv = json.loads((state / "argv-claude").read_text())
+        rec = load_plan(claude_id) or {}
+        said = next((a for a in argv if "What you were asked:" in str(a)), "")
+        check("plan-revise-no-resume", "--resume" not in argv and "sess-claude" not in argv
+              and "add a marker file" in said and "primes.txt lists five primes" in said
+              and "UNDERSTOOD: Make primes.txt." in said and "start the list at 2" in said)
+        check("plan-revise", r.returncode == 0 and len(rec.get("asks") or []) == 2 and "Ada then added" in (plan_path(claude_id) / "PLAN.md").read_text())
+
+    # A different provider still has to see the original request.
+    shed = run_cli(["new", "--who", "claude", "--cwd", str(work), "--name", "Bike paint", "--",
+                    "paint the bike shed red with two coats"])
+    shed_rec = {}
+    try:
+        shed_rec = json.loads(shed.stdout or "{}")
+    except ValueError:
+        shed_rec = {}
+    (state / "argv-codex").unlink(missing_ok=True)
+    rev = run_cli(["revise", shed_rec.get("id") or "missing", "--who", "codex", "--", "start at 2"])
+    argv = json.loads((state / "argv-codex").read_text()) if (state / "argv-codex").is_file() else []
+    prompt = next((a for a in argv if "What you were asked:" in str(a)), "")
+    kept_task = ("paint the bike shed red with two coats" in prompt and "start at 2" in prompt
+                 and "--resume" not in argv and "sess-claude" not in argv)
+    if not kept_task:
+        sys.stderr.write(f"plan-revise-keeps-task: rc {rev.returncode} prompt {prompt[-240:]!r}\n")
+    check("plan-revise-keeps-task", rev.returncode == 0 and kept_task)
+
+    # A revise that fails must not switch the provider or claim that provider wrote the plan.
+    fail_codex = bindir / "fail-codex"
+    fail_codex.write_text("#!/bin/sh\nexit 1\n")
+    fail_codex.chmod(0o755)
+    stay = run_cli(["new", "--who", "claude", "--cwd", str(work), "--name", "Stay", "--",
+                    "paint the bike shed red with two coats"])
+    stay_rec = {}
+    try:
+        stay_rec = json.loads(stay.stdout or "{}")
+    except ValueError:
+        stay_rec = {}
+    failed = run_cli(["revise", stay_rec.get("id") or "missing", "--who", "codex", "--", "start at 2"],
+                     env=dict(os.environ, ALEXUS_CODEX=str(fail_codex)))
+    failed_out = {}
+    try:
+        failed_out = json.loads(failed.stdout or "{}")
+    except ValueError:
+        failed_out = {}
+    saved_stay = load_plan(stay_rec.get("id") or "") or {}
+    stayed = (failed_out.get("ok") is False and saved_stay.get("who") == "claude"
+              and saved_stay.get("planner_read_only") is False
+              and saved_stay.get("planner_isolation") == "throwaway copy"
+              and len(saved_stay.get("asks") or []) == 1
+              and saved_stay.get("understood") == "Make primes.txt.")
+    if not stayed:
+        sys.stderr.write(f"plan-revise-failed-keeps-who: rc {failed.returncode} out {failed_out} saved {saved_stay.get('who')} {saved_stay.get('planner_read_only')} {saved_stay.get('planner_isolation')}\n")
+    check("plan-revise-failed-keeps-who", stayed)
+
+    # Past failures: keyword overlap, 3 matches, 1500 characters, nothing when the words do not overlap.
+    agents = state / "agents"
+    agents.mkdir(exist_ok=True)
+    planted = {
+        "inv-a": {"task": "repair the invoice export totals mismatch", "ended": "2026-11-09T00:00:04",
+                  "status": "failed", "verdict": "dead end", "cwd": "/proj/invoices",
+                  "checks": [{"claim": "totals match", "cmd": "test -f x", "ok": False}],
+                  "critic": {"refuted": ["export drops the last row " + ("Z" * 4000)]}},
+        "inv-b": {"task": "invoice export layout", "ended": "2026-11-09T00:00:03",
+                  "status": "failed", "verdict": "dead end", "cwd": "/proj/invoices"},
+        "inv-c": {"task": "invoice export printer jam", "ended": "2026-11-09T00:00:02",
+                  "status": "failed", "verdict": "dead end", "cwd": "/proj/invoices"},
+        "inv-d": {"task": "invoice font size", "ended": "2026-11-09T00:00:01",
+                  "status": "failed", "verdict": "dead end", "cwd": "/proj/invoices"},
+        "inv-e": {"task": "invoice export totals runningmarker", "ended": "",
+                  "status": "running", "verdict": "dead end", "cwd": "/proj/invoices"},
+        "login-shared": {"task": "tighten the gate latch", "ended": "2026-11-08T00:00:00",
+                         "status": "failed", "verdict": "dead end", "cwd": "/Users/alice/Developer/invoices",
+                         "checks": [{"claim": "latch holds", "cmd": "test -f x", "ok": False}]},
+    }
+    for name, st in planted.items():
+        d = agents / name
+        d.mkdir()
+        st = dict(st, id=name)
+        (d / "state.json").write_text(json.dumps(st))
+
+    past_doc = """UNDERSTOOD: Fix the export.
+WILL: correct the totals.
+WONT: nothing else.
+WALLS:
+none
+## Checklist
+- [ ] totals file exists :: verify: true
+"""
+    past_fake = bindir / "past-claude"
+    past_fake.write_text(planner_body("claude", past_doc).replace(
+        "pathlib.Path(home, 'argv-' + who).write_text(json.dumps(sys.argv))\n",
+        "pathlib.Path(home, 'argv-' + who).write_text(json.dumps(sys.argv))\n"
+        "pathlib.Path(home, 'last-argv.json').write_text(json.dumps(sys.argv))\n",
+    ))
+    past_fake.chmod(0o755)
+    env = os.environ.copy()
+    env["ALEXUS_CLAUDE"] = str(past_fake)
+    r = run_cli(["new", "--who", "claude", "--cwd", str(work), "--name", "Export totals", "--",
+                 "invoice export totals are wrong"], env=env)
+    data = json.loads(r.stdout or "{}")
+    past = data.get("past") or ""
+    argv = json.loads((state / "last-argv.json").read_text()) if (state / "last-argv.json").is_file() else []
+    prompt = next((a for a in argv if "What you were asked:" in a), "")
+    related = ("PAST FAILURES" in prompt and "totals match" in past and "printer" in past and "layout" in past
+               and "font" not in past and "runningmarker" not in past and "export drops the last row" in past
+               and "dead end" in past)
+    if not related:
+        sys.stderr.write(f"plan-past-related: {past[:500]!r}\n")
+    check("plan-past-related", r.returncode == 0 and related)
+    check("plan-past-limit", 0 < len(past) <= PAST_LIMIT and past.count("Asked:") == 3 and "Z" * 2000 not in past)
+    # A later revise whose words do not overlap must not drop the failures already saved.
+    (state / "last-argv.json").unlink(missing_ok=True)
+    rev_past = run_cli(["revise", data.get("id") or "missing", "--", "start the list at 2"], env=env)
+    kept_past_rec = load_plan(data.get("id") or "") or {}
+    kept_md = (plan_path(data["id"]) / "PLAN.md").read_text() if data.get("id") else ""
+    kept_argv = json.loads((state / "last-argv.json").read_text()) if (state / "last-argv.json").is_file() else []
+    kept_prompt = next((a for a in kept_argv if "What you were asked:" in str(a)), "")
+    past_kept = ("totals match" in (kept_past_rec.get("past") or "") and "Past failures" in kept_md
+                 and "totals match" in kept_md and "PAST FAILURES" in kept_prompt and "totals match" in kept_prompt)
+    if not past_kept:
+        sys.stderr.write(f"plan-revise-keeps-past: rc {rev_past.returncode} past {(kept_past_rec.get('past') or '')[:200]!r}\n")
+    check("plan-revise-keeps-past", rev_past.returncode == 0 and past_kept)
+    md = (plan_path(data["id"]) / "PLAN.md").read_text() if data.get("id") else ""
+    # Point a worker at that file and stop it. The failure text has to be in PLAN.md.
+    worker = (
+        '{"type":"system","subtype":"init","session_id":"w","model":"x"}\n'
+        '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"keep.txt"}}]}}\n'
+        '{"type":"result","is_error":false,"result":"DONE: noted\\nLEFT: nothing","num_turns":1,"session_id":"w"}\n'
+    )
+    critic = '{"type":"result","is_error":false,"result":"VERDICT: pass","session_id":"c"}\n'
+    worker_path = bindir / "worker"
+    worker_path.write_text(
+        "#!/usr/bin/env python3\nimport sys\n"
+        "args = ' '.join(sys.argv)\n"
+        "if 'VERDICT:' in args or 'critic in a proved' in args:\n"
+        "    sys.stdout.write(" + repr(critic) + ")\n"
+        "    sys.exit(0)\n"
+        "sys.stdout.write(" + repr(worker) + ")\n"
+    )
+    worker_path.chmod(0o755)
+    env["ALEXUS_CLAUDE"] = str(worker_path)
+    env["ALEXUS_CRITICS"] = "claude"
+    agent_mod().write_config({"owner": "Ada", "clis": ["claude"], "default_who": "claude", "handoff": []})
+    rs = run_cli(["start", data.get("id") or "missing"], env=env, timeout=20)
+    rid = (rs.stdout or "").strip().splitlines()[-1] if rs.returncode == 0 else ""
+    task_body = ""
+    if rid:
+        task_file = state / "agents" / rid / "task.txt"
+        if task_file.is_file():
+            task_body = task_file.read_text()
+        subprocess.run(["pkill", "-f", " run " + rid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    check("plan-past-in-plan-md", "Past failures" in md and "totals match" in md and "PLAN.md" in task_body)
+
+    r = run_cli(["new", "--who", "claude", "--cwd", str(work), "--name", "Bike shed", "--",
+                 "paint the bike shed"], env=dict(env, ALEXUS_CLAUDE=str(past_fake)))
+    data2 = json.loads(r.stdout or "{}")
+    argv2 = json.loads((state / "last-argv.json").read_text()) if (state / "last-argv.json").is_file() else []
+    prompt2 = next((a for a in argv2 if "What you were asked:" in a), "")
+    md2 = (plan_path(data2["id"]) / "PLAN.md").read_text() if data2.get("id") else ""
+    check("plan-past-unrelated", r.returncode == 0 and "past" not in data2 and "PAST FAILURES" not in prompt2
+          and "totals match" not in prompt2 and "Past failures" not in md2)
+    same_login = past_failures("paint the bike shed", "/Users/alice/Developer/fence")
+    check("plan-past-not-username", same_login == "" and "latch" not in same_login and "gate" not in same_login)
+
+    # One shared word is not a match. A parent folder name is not a match. A proved run is not a failure.
+    extra = {
+        "please-bill": {"task": "please repair the invoice export", "ended": "2026-11-07T00:00:03",
+                        "status": "failed", "verdict": "dead end", "cwd": "/opt/billing"},
+        "rocket-parent": {"task": "tune the rocket engine", "ended": "2026-11-07T00:00:02",
+                          "status": "failed", "verdict": "dead end", "cwd": "/Users/alice/Projects/rockets"},
+        "coffee-proved-a": {"task": "brew green coffee service", "ended": "2026-11-07T00:00:09",
+                            "status": "done", "verdict": "proved", "cwd": "/opt/cafe"},
+        "coffee-proved-b": {"task": "brew green coffee tasting", "ended": "2026-11-07T00:00:08",
+                            "status": "done", "verdict": "proved", "cwd": "/opt/cafe"},
+        "coffee-proved-c": {"task": "brew green coffee order", "ended": "2026-11-07T00:00:07",
+                            "status": "done", "verdict": "proved", "cwd": "/opt/cafe"},
+        "coffee-failed": {"task": "brew green coffee line clogged", "ended": "2026-11-07T00:00:01",
+                          "status": "failed", "verdict": "dead end", "cwd": "/opt/cafe",
+                          "checks": [{"claim": "the line runs", "cmd": "test -f x", "ok": False}]},
+    }
+    token = "gh" + "p_" + "A1b2C3d4" * 4
+    extra.update({
+        "coffee-plain-ok": {"task": "brew green coffee plainrun", "ended": "2026-11-07T00:00:06",
+                            "status": "done", "cwd": "/opt/cafe"},
+        "coffee-needs-you": {"task": "brew green coffee needsrun", "ended": "2026-11-07T00:00:05",
+                             "status": "done", "verdict": "needs you", "cwd": "/opt/cafe"},
+        "kiln-secret": {"task": "calibrate pottery kiln firmware", "ended": "2026-11-07T00:00:04",
+                        "status": "failed", "verdict": "dead end", "cwd": "/opt/kiln",
+                        "critic": {"refuted": ["it printed " + token + " into the log"]}},
+        "kiln-damaged": {"task": ["calibrate", "pottery", "kiln"], "ended": "2026-11-07T00:00:03", "checks": 7,
+                         "status": "failed", "verdict": "dead end", "cwd": "/opt/kiln"},
+    })
+    for name, st in extra.items():
+        d = agents / name
+        d.mkdir()
+        (d / "state.json").write_text(json.dumps(dict(st, id=name)))
+    one_word = past_failures("please paint the bike shed", "/opt/garden")
+    check("plan-past-one-word", one_word == "" and "invoice" not in one_word and "billing" not in one_word)
+    leaf = past_failures("bake a cake", "/Users/alice/Projects/bakery")
+    check("plan-past-leaf-folder", leaf == "" and "rocket" not in leaf and "engine" not in leaf)
+    coffee = past_failures("brew green coffee", "/opt/cafe")
+    skips_proved = ("clogged" in coffee and "the line runs" in coffee and "proved" not in coffee.lower()
+                    and coffee.count("Asked:") == 1)
+    if not skips_proved:
+        sys.stderr.write(f"plan-past-skips-proved: {coffee[:400]!r}\n")
+    check("plan-past-skips-proved", skips_proved)
+    check("plan-past-skips-success", "clogged" in coffee and "plainrun" not in coffee and "needsrun" not in coffee)
+    kiln = past_failures("calibrate pottery kiln firmware again", "/opt/kiln")
+    check("plan-past-no-secrets", "it printed" in kiln and "[removed]" in kiln and token not in kiln)
+
+    # Worker choice and handoff come from settings, or from --who. No walls, so handoff stays on.
+    agent_mod().write_config({"owner": "Ada", "clis": ["grok", "claude", "codex"],
+                              "default_who": "grok", "handoff": ["claude", "codex"]})
+    grok_worker = (
+        '{"type":"system","subtype":"init","session_id":"g","model":"grok"}\n'
+        '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"keep.txt"}}]}}\n'
+        '{"type":"result","is_error":false,"result":"DONE: grok did it\\nLEFT: nothing","num_turns":1,"session_id":"g"}\n'
+    )
+    codex_worker = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "cx"}),
+        json.dumps({"type": "item.started", "item": {"id": "c1", "type": "command_execution", "command": "true"}}),
+        json.dumps({"type": "item.completed", "item": {"id": "c1", "type": "command_execution", "exit_code": 0}}),
+        json.dumps({"type": "item.completed", "item": {"id": "m", "type": "agent_message", "text": "DONE: codex did it\nLEFT: nothing"}}),
+        json.dumps({"type": "turn.completed"}),
+    ]) + "\n"
+    for name, payload in (("grok", grok_worker), ("codex", codex_worker), ("claude", worker)):
+        path = bindir / f"work-{name}"
+        text = ("#!/usr/bin/env python3\nimport sys\n"
+                "args = ' '.join(sys.argv)\n"
+                "if 'VERDICT:' in args or 'critic in a proved' in args:\n"
+                "    sys.stdout.write(" + repr(critic) + ")\n"
+                "    sys.exit(0)\n"
+                "sys.stdout.write(" + repr(payload) + ")\n")
+        path.write_text(text)
+        path.chmod(0o755)
+    env = os.environ.copy()
+    env["ALEXUS_GROK"] = str(bindir / "work-grok")
+    env["ALEXUS_CODEX"] = str(bindir / "work-codex")
+    env["ALEXUS_CLAUDE"] = str(bindir / "work-claude")
+    env["ALEXUS_CRITICS"] = "claude"
+    ck = work / "yes.md"
+    ck.write_text("- [ ] marker :: verify: true\n")
+    made = run_cli(["create", "--cwd", str(work), "--name", "Ship widget", "--checklist", str(ck), "--", "ship the widget"], env=env)
+    made_rec = json.loads(made.stdout or "{}")
+    started = run_cli(["start", made_rec.get("id") or ""], env=env, timeout=30)
+    st = _wait_run(state, started, 30)
+    kept = (started.returncode == 0 and st.get("who") == "grok" and st.get("handoff_chain") == ["claude", "codex"]
+            and not st.get("handoffs") and "PLAN.md" in ((state / "agents" / st.get("id", "x") / "task.txt").read_text()
+                                                         if st.get("id") and (state / "agents" / st["id"] / "task.txt").exists() else ""))
+    if not kept:
+        sys.stderr.write(f"plan-handoff-kept: rc {started.returncode} {started.stderr[:300]!r} state {st}\n")
+    # --who overrides the worker and still passes the settings handoff.
+    made2 = run_cli(["create", "--cwd", str(work), "--name", "Ship via codex", "--checklist", str(ck), "--", "ship via codex"], env=env)
+    rec2 = json.loads(made2.stdout or "{}")
+    started2 = run_cli(["start", "--who", "codex", rec2.get("id") or ""], env=env, timeout=30)
+    st2 = _wait_run(state, started2, 30)
+    who_ok = started2.returncode == 0 and st2.get("who") == "codex" and st2.get("handoff_chain") == ["claude"]
+    if not who_ok:
+        sys.stderr.write(f"plan-start-who: rc {started2.returncode} {started2.stderr[:300]!r} state {st2}\n")
+    check("plan-handoff-kept", kept and who_ok and WALLS_LIMIT not in (plan_path(made_rec.get("id") or "no") / "PLAN.md").read_text())
+
+    # The planner's model name must not be handed to a worker from another provider.
+    made_m = run_cli(["create", "--cwd", str(work), "--name", "Model", "--model", "codex-big", "--checklist", str(ck),
+                      "--", "model stays put"], env=env)
+    rec_m = json.loads(made_m.stdout or "{}")
+    if rec_m.get("id"):
+        save_plan(dict(load_plan(rec_m["id"]), who="codex"))
+    argv_grok = bindir / "model-grok"
+    argv_grok.write_text((bindir / "work-grok").read_text().replace("import sys\n", (
+        "import os, sys\nopen(os.path.join(os.environ['ALEXUS_HOME'], 'model-argv'), 'a')"
+        ".write(' '.join(sys.argv) + '\\n')\n"), 1))
+    argv_grok.chmod(0o755)
+    started_m = run_cli(["start", "--who", "grok", rec_m.get("id") or ""],
+                        env=dict(env, ALEXUS_GROK=str(argv_grok)), timeout=30)
+    st_m = _wait_run(state, started_m, 30)
+    seen_m = (state / "model-argv").read_text() if (state / "model-argv").is_file() else ""
+    check("plan-start-model-not-crossed", started_m.returncode == 0 and st_m.get("who") == "grok"
+          and "--cwd" in seen_m and "codex-big" not in seen_m and plan_model({"who": "codex", "model": "m"}, "codex") == "m"
+          and plan_model({"model": "m"}, "grok") == "m")
+
+    # A plain wall is not enforced, so handoff stays on and the Claude sentence is absent.
+    plain = work / "plain.walls"
+    plain.write_text("be kind to the reader\n")
+    made_p = run_cli(["create", "--cwd", str(work), "--name", "Plain wall", "--checklist", str(ck),
+                      "--walls", str(plain), "--", "ship kindly"], env=env)
+    rec_p = json.loads(made_p.stdout or "{}")
+    md_p = (plan_path(rec_p.get("id") or "no") / "PLAN.md").read_text() if rec_p.get("id") else ""
+    started_p = run_cli(["start", rec_p.get("id") or ""], env=env, timeout=30)
+    st_p = _wait_run(state, started_p, 30)
+    check("plan-plain-wall-keeps-handoff", started_p.returncode == 0 and st_p.get("who") == "grok"
+          and st_p.get("handoff_chain") == ["claude", "codex"] and WALLS_LIMIT not in md_p
+          and st_p.get("domain") and st_p["domain"]["walls"][0]["enforced"] is False)
+
+    # Enforced walls: Claude only, handoff off, and the plan says so.
+    wfile = work / "hard.walls"
+    wfile.write_text("no-network\n")
+    made_w = run_cli(["create", "--cwd", str(work), "--name", "Walled", "--checklist", str(ck),
+                      "--walls", str(wfile), "--", "ship with no network"], env=env)
+    rec_w = json.loads(made_w.stdout or "{}")
+    md_w = (plan_path(rec_w.get("id") or "no") / "PLAN.md").read_text() if rec_w.get("id") else ""
+    check("plan-walls-phrase", WALLS_LIMIT in md_w and "no-network" in md_w)
+    before = set(p.name for p in (state / "agents").iterdir()) if (state / "agents").exists() else set()
+    for marker in ("ran-claude", "ran-grok", "ran-codex"):
+        (state / marker).unlink(missing_ok=True)
+    refused = run_cli(["start", "--who", "grok", rec_w.get("id") or ""], env=env, timeout=20)
+    after = set(p.name for p in (state / "agents").iterdir()) if (state / "agents").exists() else set()
+    started_w = run_cli(["start", rec_w.get("id") or ""], env=env, timeout=30)
+    st_w = _wait_run(state, started_w, 30)
+    grok_ran = (state / "ran-grok").is_file()
+    walled_ok = (refused.returncode != 0 and WALLS_LIMIT in (refused.stderr or "") and after == before
+                 and started_w.returncode == 0 and st_w.get("who") == "claude" and st_w.get("handoff_chain") == []
+                 and not st_w.get("handoffs") and not grok_ran)
+    if not walled_ok:
+        sys.stderr.write(f"plan-walls: refuse {refused.returncode} {refused.stderr!r} state {st_w}\n")
+    check("plan-walls-claude-only", walled_ok)
+
+    # A worker that rewrites the checklist does not change the command that is run.
+    agent_mod().write_config({"owner": "Ada", "clis": ["claude"], "default_who": "claude", "handoff": []})
+    weaken = (
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "args = ' '.join(sys.argv)\n"
+        "root = os.environ.get('ALEXUS_HOME', '')\n"
+        "run = os.environ.get('ALEXUS_RUN', '')\n"
+        "d = os.path.join(root, 'agents', run) if root and run else ''\n"
+        "if 'VERDICT:' in args or 'critic in a proved' in args:\n"
+        "    sys.stdout.write(" + repr(critic) + ")\n"
+        "    sys.exit(0)\n"
+        "if d:\n"
+        "    open(os.path.join(d, 'checklist.md'), 'w').write('- [ ] missing proof :: verify: true\\n')\n"
+        "sys.stdout.write(" + repr(worker) + ")\n"
+    )
+    weak = bindir / "weaken"
+    weak.write_text(weaken)
+    weak.chmod(0o755)
+    hard_ck = work / "hard.md"
+    hard_ck.write_text("- [ ] missing proof :: verify: test -f this-file-is-missing\n")
+    made_f = run_cli(["create", "--cwd", str(work), "--name", "Frozen", "--checklist", str(hard_ck), "--", "leave a proof"],
+                     env=dict(env, ALEXUS_CLAUDE=str(weak)))
+    rec_f = json.loads(made_f.stdout or "{}")
+    env_f = dict(env, ALEXUS_CLAUDE=str(weak), ALEXUS_CRITICS="claude")
+    agent_mod().write_config({"owner": "Ada", "clis": ["claude"], "default_who": "claude", "handoff": []})
+    started_f = run_cli(["start", rec_f.get("id") or ""], env=env_f, timeout=40)
+    st_f = _wait_run(state, started_f, 40)
+    frozen = ""
+    live = ""
+    cmd = ""
+    if st_f.get("id"):
+        rd = state / "agents" / st_f["id"]
+        frozen = (rd / "checklist.frozen").read_text() if (rd / "checklist.frozen").exists() else ""
+        live = (rd / "checklist.md").read_text() if (rd / "checklist.md").exists() else ""
+        checks = st_f.get("checks") or []
+        cmd = checks[0]["cmd"] if checks else ""
+    froze = ("test -f this-file-is-missing" in frozen and "verify: true" in live and cmd == "test -f this-file-is-missing"
+             and st_f.get("verdict") != "proved" and (st_f.get("checks") or [{}])[0].get("ok") is False)
+    if not froze:
+        sys.stderr.write(f"plan-frozen: state {st_f.get('verdict')} {st_f.get('verdict_note')} cmd {cmd!r} frozen {frozen!r} live {live!r}\n")
+    check("plan-frozen-checklist", started_f.returncode == 0 and froze)
+
+    # When sandbox-exec cannot apply, the planner is shown the copy and is not told the real path.
+    sbdir = home / "sbbin"
+    sbdir.mkdir()
+    (sbdir / "sandbox-exec").write_text(
+        "#!/bin/sh\necho 'sandbox-exec: sandbox_apply: Operation not permitted' >&2\nexit 71\n")
+    (sbdir / "sandbox-exec").chmod(0o755)
+    shell_claude = bindir / "shell-claude"
+    shell_claude.write_text(
+        "#!/bin/sh\n"
+        "home=\"$ALEXUS_HOME\"\n"
+        "printf '%s\\n' \"$@\" > \"$home/nosb-argv\"\n"
+        "env > \"$home/nosb-env\"\n"
+        "folder=$(printf '%s\\n' \"$@\" | awk '/^Task folder: / { sub(/^Task folder: /, \"\"); print; exit }')\n"
+        "if [ -n \"$folder\" ]; then echo abs > \"$folder/planner-must-not-write\" 2>\"$home/nosb-write-err\" || true; fi\n"
+        "if [ -n \"$ALEXUS_PLAN_REAL\" ]; then echo envreal > \"$ALEXUS_PLAN_REAL/from-env\" 2>>\"$home/nosb-write-err\" || true; fi\n"
+        "printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"UNDERSTOOD: copy.\\nWILL: none.\\nWONT: none.\\nWALLS:\\nnone\\n## Checklist\\n- [ ] marker :: verify: true\\n\"}]}}'\n"
+        "printf '%s\\n' '{\"type\":\"result\",\"result\":\"ok\",\"session_id\":\"sess-nosb\"}'\n"
+    )
+    shell_claude.chmod(0o755)
+    bad = work / "planner-must-not-write"
+    if bad.exists():
+        bad.unlink()
+    from_env = work / "from-env"
+    if from_env.exists():
+        from_env.unlink()
+    hide_env = os.environ.copy()
+    hide_env.pop("PLAN_SC_REAL", None)
+    hide_env.pop("ALEXUS_PLAN_REAL", None)
+    hide_env["PATH"] = str(sbdir) + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
+    hide_env["ALEXUS_CLAUDE"] = str(shell_claude)
+    hidden_run = run_cli(["new", "--who", "claude", "--cwd", str(work), "--name", "Hide", "--", "leave the folder alone"],
+                         env=hide_env)
+    real_s = str(work.resolve())
+    argv_text = (state / "nosb-argv").read_text() if (state / "nosb-argv").is_file() else ""
+    env_text = (state / "nosb-env").read_text() if (state / "nosb-env").is_file() else ""
+    shown = ""
+    for ln in argv_text.splitlines():
+        if ln.startswith("Task folder: "):
+            shown = ln[len("Task folder: "):].strip()
+            break
+    hidden = (hidden_run.returncode == 0 and shown.startswith("/") and shown != real_s
+              and real_s not in argv_text and real_s not in env_text
+              and "ALEXUS_PLAN_REAL=" not in env_text
+              and not bad.exists() and not from_env.exists()
+              and (work / "keep.txt").read_text() == "keep"
+              and (os.stat(work).st_mode & 0o7777) == 0o1755)
+    if not hidden:
+        sys.stderr.write(
+            f"plan-copy-hides-real: rc {hidden_run.returncode} shown {shown!r} real {real_s!r} "
+            f"in_argv {real_s in argv_text} in_env {real_s in env_text} "
+            f"bad {bad.exists()} envreal {from_env.exists()} "
+            f"mode {oct(os.stat(work).st_mode & 0o7777)} err {(hidden_run.stderr or '')[:300]!r}\n")
+    check("plan-copy-hides-real", hidden)
+
+    # Walls the person removed stay off when the planner repeats them.
+    wall_doc = """UNDERSTOOD: Ship it.
+WILL: ship.
+WONT: nothing else.
+WALLS:
+- no-network
+## Checklist
+- [ ] marker :: verify: true
+"""
+    wall_fake = bindir / "wall-claude"
+    wall_fake.write_text(planner_body("claude", wall_doc))
+    wall_fake.chmod(0o755)
+    wall_env = os.environ.copy()
+    wall_env["ALEXUS_CLAUDE"] = str(wall_fake)
+    wmade = run_cli(["new", "--who", "claude", "--cwd", str(work), "--name", "Clear walls", "--", "ship the crate"],
+                    env=wall_env)
+    wrec = {}
+    try:
+        wrec = json.loads(wmade.stdout or "{}")
+    except ValueError:
+        wrec = {}
+    run_cli(["edit", wrec.get("id") or "missing", "--no-walls"], env=wall_env)
+    wrev = run_cli(["revise", wrec.get("id") or "missing", "--", "small wording change"], env=wall_env)
+    wsaved = load_plan(wrec.get("id") or "") or {}
+    wmd = (plan_path(wrec["id"]) / "PLAN.md").read_text() if wrec.get("id") else ""
+    walls_off = (wmade.returncode == 0 and wrev.returncode == 0 and wsaved.get("walls") == []
+                 and wsaved.get("walls_kept") is False and WALLS_LIMIT not in wmd and "no-network" not in wmd)
+    if not walls_off:
+        sys.stderr.write(f"plan-walls-stay-off: rc {wrev.returncode} walls {wsaved.get('walls')} md {wmd[:240]!r}\n")
+    check("plan-walls-stay-off", walls_off)
+    told = wmade.stderr or ""
+    check("plan-new-says-next", wrec.get("walls_limit") == WALLS_LIMIT and WALLS_LIMIT in told
+          and "plan start " + str(wrec.get("id")) in told and wrec.get("plan_md", "").endswith("PLAN.md")
+          and "walls_limit" not in wsaved)
+
+    # A check must not freeze the throwaway copy's absolute path.
+    path_fake = bindir / "path-claude"
+    path_fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "blob = ' '.join(sys.argv)\n"
+        "marker = 'Task folder: '\n"
+        "i = blob.find(marker)\n"
+        "folder = blob[i + len(marker):].split()[0] if i >= 0 else 'MISSING'\n"
+        "home = os.environ.get('ALEXUS_HOME', '')\n"
+        "open(os.path.join(home, 'path-argv.json'), 'w').write(json.dumps(sys.argv))\n"
+        "text = ('UNDERSTOOD: Keep ' + folder + '/keep.txt.\\nWILL: leave it.\\nWONT: nothing else.\\nWALLS:\\n- write-only: ' + folder + '/out\\n'\n"
+        "        '## Checklist\\n- [ ] keep.txt is there :: verify: test -f ' + folder + '/keep.txt\\n')\n"
+        "line = json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': text}]}})\n"
+        "sys.stdout.write(line + '\\n')\n"
+        "sys.stdout.write(json.dumps({'type': 'result', 'result': 'ok', 'session_id': 'sess-path'}) + '\\n')\n"
+    )
+    path_fake.chmod(0o755)
+    path_env = os.environ.copy()
+    path_env["ALEXUS_CLAUDE"] = str(path_fake)
+    pmade = run_cli(["new", "--who", "claude", "--cwd", str(work), "--name", "Relative", "--", "keep the file"],
+                    env=path_env)
+    prec = {}
+    try:
+        prec = json.loads(pmade.stdout or "{}")
+    except ValueError:
+        prec = {}
+    pck = prec.get("checklist") or ""
+    pargv = json.loads((state / "path-argv.json").read_text()) if (state / "path-argv.json").is_file() else []
+    guide_text = " ".join(str(a) for a in pargv)
+    relative = (pmade.returncode == 0 and "alexus-plan-" not in pck and "/private/var/folders" not in pck
+                and "test -f keep.txt" in pck and "relative to the task folder" in guide_text
+                and "relative to the task folder" in planner_guide("Ada"))
+    if not relative:
+        sys.stderr.write(f"plan-check-relative: rc {pmade.returncode} ck {pck!r}\n")
+    check("plan-check-relative", relative)
+    pwalls = prec.get("walls") or [{}]
+    check("plan-wall-relative", pwalls[0].get("text") == "write-only: out" and pwalls[0].get("items") == ["out"]
+          and prec.get("understood") == "Keep keep.txt.")
+    this_file = Path(__file__).resolve()
+    check("plan-one-entry", not os.access(this_file, os.X_OK) and ("__main" + "__") not in this_file.read_text())
+
+    # A stop during planning must leave the task folder's mode bits as they were.
+    slow = bindir / "slow-claude"
+    slow.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, sys, time\n"
+        "home = os.environ.get('ALEXUS_HOME', '')\n"
+        "blob = ' '.join(sys.argv)\n"
+        "marker = 'Task folder: '\n"
+        "i = blob.find(marker)\n"
+        "watch = os.environ.get('PLAN_SC_REAL', '')\n"
+        "if not watch and i >= 0:\n"
+        "    watch = blob[i + len(marker):].split()[0]\n"
+        "if watch:\n"
+        "    pathlib.Path(home, 'slow-mode').write_text(str(os.stat(watch).st_mode & 0o7777))\n"
+        "pathlib.Path(home, 'slow-started').write_text('1')\n"
+        "time.sleep(30)\n"
+    )
+    slow.chmod(0o755)
+    held = os.environ.copy()
+    held["ALEXUS_CLAUDE"] = str(slow)
+    proc = subprocess.Popen([py, "-B", "-I", script, "plan", "new", "--who", "claude", "--cwd", str(work), "--", "hold still"],
+                            env=held, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.time() + 10
+    while time.time() < deadline and not (state / "slow-started").exists():
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait(timeout=5)
+    sig_d = os.stat(work).st_mode & 0o7777
+    sig_f = os.stat(work / "keep.txt").st_mode & 0o7777
+    can_write = True
+    try:
+        (work / "after-stop.txt").write_text("ok")
+    except OSError:
+        can_write = False
+    during = (state / "slow-mode").read_text().strip() if (state / "slow-mode").is_file() else ""
+    stopped_ok = ((state / "slow-started").is_file() and during == str(0o1755)
+                  and sig_d == 0o1755 and sig_f == 0o644 and can_write)
+    if not stopped_ok:
+        sys.stderr.write(f"plan-sigterm-keeps-mode: during {during!r} dir {oct(sig_d)} file {oct(sig_f)} write {can_write} rc {proc.returncode}\n")
+    check("plan-sigterm-keeps-mode", stopped_ok)
+    return 0 if ok else 1
+
+
+def _wait_run(state, proc, timeout):
+    if proc.returncode != 0:
+        return {}
+    lines = (proc.stdout or "").strip().splitlines()
+    if not lines:
+        return {}
+    rid = lines[-1].strip()
+    d = state / "agents" / rid
+    end = time.time() + timeout
+    st = {}
+    while time.time() < end:
+        try:
+            st = json.loads((d / "state.json").read_text())
+        except Exception:
+            st = {}
+        if st.get("ended"):
+            break
+        time.sleep(0.05)
+    pid = st.get("pid")
+    if pid:
+        try:
+            os.killpg(int(pid), signal.SIGKILL)
+        except Exception:
+            pass
+    subprocess.run(["pkill", "-f", " run " + rid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        st = json.loads((d / "state.json").read_text())
+    except Exception:
+        pass
+    return st
+
+
+def main(argv=None):
+    a = agent_mod()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if argv[0] == "selfcheck":
+        return selfcheck()
+    verb, rest = argv[0], argv[1:]
+    cwd, model, name, ck, task_file, as_json = os.getcwd(), None, None, None, None, False
+    who, walls_file, no_walls = None, None, False
+    words = []
+    it = iter(rest)
+    for x in it:
+        if x == "--cwd":
+            cwd = os.path.abspath(os.path.expanduser(_take(it)))
+        elif x == "--model":
+            model = _take(it)
+        elif x == "--name":
+            name = _take(it)
+        elif x == "--who":
+            who = _take(it)
+        elif x == "--checklist":
+            ck = Path(os.path.expanduser(_take(it))).read_text()
+        elif x == "--task-file":
+            task_file = Path(os.path.expanduser(_take(it))).read_text().strip()
+        elif x == "--walls":
+            walls_file = _take(it)
+        elif x == "--no-walls":
+            no_walls = True
+        elif x == "--json":
+            as_json = True
+        elif x == "--":
+            words.append(" ".join(it))
+            break
+        elif x == "-":
+            words.append(sys.stdin.read())
+        elif x.startswith("-"):
+            print(__doc__)
+            return 2
+        else:
+            words.append(x)
+    text = " ".join(w for w in words if w is not None).strip()
+    out = lambda o: print(json.dumps(o))
+    if verb == "precheck":
+        if not text:
+            print(__doc__)
+            return 2
+        out({"steps": precheck(cwd, Path(text).read_text() if not text.startswith("- [") else text)})
+    elif verb == "list":
+        ps = all_plans()
+        if as_json:
+            out(ps)
+        else:
+            for p in ps:
+                folder = p.get("cwd", "")
+                home = str(Path.home())
+                if folder.startswith(home):
+                    folder = "~" + folder[len(home):]
+                print(f"{p['id']}  {len(p.get('runs') or []):2} runs  {folder}  {p.get('name')}")
+    elif verb == "show" and text:
+        out(load_plan(text.split()[0]))
+    elif verb == "start" and text:
+        parts = text.split()
+        pid, err = start_plan(parts[0], model, who)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        print(pid)
+    elif verb == "new" and text:
+        if not os.path.isdir(cwd):
+            out({"ok": False, "error": f"no such folder: {cwd}"})
+            return 2
+        a.require_config()
+        plan = ask(cwd, text, model, who)
+        if plan.get("ok") or plan.get("raw"):
+            nm = name or a.one(text, 60)
+            saved = dict(plan, id=new_id(nm), name=nm, cwd=os.path.realpath(cwd), model=model,
+                         asks=[text], source="planner", created=stamp(), runs=[])
+            if not saved.get("past"):
+                saved.pop("past", None)
+            plan = dict(save_plan(saved), ok=plan.get("ok"), error=plan.get("error"))
+            tell_next(plan)
+        out(plan)
+    elif verb == "revise" and text:
+        parts = text.split()
+        pid, change = parts[0], " ".join(parts[1:]).strip()
+        rec = load_plan(pid)
+        if not rec:
+            out({"ok": False, "error": f"no plan {pid}"})
+            return 2
+        if not change:
+            out({"ok": False, "error": "say what to change"})
+            return 2
+        use_who = a.normalize_who(who) if who else rec.get("who")
+        use_model = model or plan_model(rec, use_who)
+        original = task_text(rec)
+        asked = revise_request(rec, change)
+        folder = rec.get("cwd") or cwd
+        # Match on the original request. The change alone ("start at 2") must not wipe saved failures.
+        found = past_failures((original + "\n" + change).strip(), folder)
+        if not found and rec.get("past"):
+            found = rec.get("past")
+        plan = ask(folder, asked, use_model, use_who, past=found)
+        if plan.get("ok"):
+            rec["asks"] = (rec.get("asks") or []) + [change]
+            rec["model"] = use_model
+            rec["cost_usd"] = (rec.get("cost_usd") or 0) + (plan.get("cost_usd") or 0)
+            if plan.get("who"):
+                rec["who"] = plan["who"]
+            if "planner_read_only" in plan:
+                rec["planner_read_only"] = plan.get("planner_read_only")
+            if plan.get("planner_isolation"):
+                rec["planner_isolation"] = plan.get("planner_isolation")
+            if plan.get("past"):
+                rec["past"] = plan["past"]
+            # Walls the person removed stay off. A later revise does not bring them back.
+            keep_off = rec.get("walls_kept") is False
+            for k in ("understood", "will", "wont", "checklist", "steps", "session", "walls"):
+                if k == "walls" and keep_off:
+                    rec["walls"] = []
+                    continue
+                if plan.get(k) is not None:
+                    rec[k] = plan[k]
+            rec["raw"] = plan.get("raw")
+            plan = dict(save_plan(rec), ok=True, error=plan.get("error"))
+            tell_next(plan)
+        else:
+            # A failed revise did not write this plan. Leave the provider and the saved past alone.
+            plan = dict(rec, ok=False, error=plan.get("error"))
+        out(plan)
+    elif verb == "create" and text and ck:
+        if not os.path.isdir(cwd):
+            out({"ok": False, "error": f"no such folder: {cwd}"})
+            return 2
+        nm = name or a.one(text, 60)
+        wlines = _wall_lines(walls_file) if walls_file else []
+        rec = {"id": new_id(nm), "name": nm, "cwd": os.path.realpath(cwd), "model": model,
+               "asks": [text], "checklist": ck.strip(), "walls": parsed_walls(wlines),
+               "steps": precheck(cwd, ck), "source": "hand", "created": stamp(), "runs": []}
+        out(dict(save_plan(rec), ok=bool(a.parse_checklist(ck))))
+    elif verb == "edit" and text:
+        rec = load_plan(text.split()[0])
+        if not rec:
+            out({"ok": False, "error": f"no plan {text.split()[0]}"})
+            return 2
+        if name:
+            rec["name"] = name
+        if task_file is not None:
+            rec["asks"] = [task_file]
+        if ck is not None:
+            rec.update(checklist=ck.strip(), steps=precheck(rec["cwd"], ck))
+        if no_walls:
+            rec["walls"] = []
+            rec["walls_kept"] = False
+        elif walls_file:
+            rec["walls"] = parsed_walls(_wall_lines(walls_file))
+            rec["walls_kept"] = True
+        out(dict(save_plan(rec), ok=True))
+    else:
+        print(__doc__)
+        return 2
+    return 0
+

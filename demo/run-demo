@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""A stranger can watch receipts: a fake AI claims done too soon, is sent back, then the run is proved.
+Default mode makes no model calls. --pause waits between steps. --real --who NAME uses a real CLI."""
+import os
+import sys
+import json
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+AR = str(ROOT / "bin" / "alexus")
+PAUSE = "--pause" in sys.argv
+REAL = "--real" in sys.argv
+
+
+def die(msg):
+    sys.stderr.write(msg + "\n")
+    sys.exit(1)
+
+
+def pause(msg):
+    print(msg)
+    if not PAUSE:
+        return
+    try:
+        input("Press Enter to continue...")
+    except EOFError:
+        pass
+
+
+def load_caller_config():
+    """Settings from the caller's HOME / ALEXUS_HOME, before the demo makes its own folder."""
+    arh = os.environ.get("ALEXUS_HOME")
+    if arh:
+        p = Path(arh) / "config.json"
+    else:
+        p = Path(os.environ.get("HOME") or str(Path.home())) / ".alexus" / "config.json"
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def installed_clis():
+    found = []
+    for name in ("claude", "grok", "codex"):
+        if shutil.which(name):
+            found.append(name)
+    return found
+
+
+def who_arg():
+    if "--who" in sys.argv:
+        i = sys.argv.index("--who")
+        if i + 1 >= len(sys.argv):
+            die("demo/run-demo: --who needs a name")
+        return sys.argv[i + 1]
+    if not REAL:
+        return "claude"
+    cfg = load_caller_config()
+    found = installed_clis()
+    default = str(cfg.get("default_who") or "").strip().lower()
+    if default in found:
+        return default
+    if found:
+        return found[0]
+    die("demo/run-demo: no supported AI CLI found on PATH (looked for claude, grok, and codex)")
+
+
+def run_ar(args, env, cwd=None, timeout=120):
+    return subprocess.run([sys.executable, "-I", AR, *args], env=env, cwd=cwd,
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def wait_ended(arh, rid, timeout=90):
+    d = Path(arh) / "agents" / rid
+    end = time.time() + timeout
+    last = None
+    while time.time() < end:
+        p = d / "state.json"
+        if p.is_file():
+            try:
+                last = json.loads(p.read_text())
+            except ValueError:
+                last = None
+            if last and last.get("ended"):
+                return last
+        time.sleep(0.05)
+    return None
+
+
+def git_init(work):
+    subprocess.run(["git", "init"], cwd=str(work), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "demo@example.com"], cwd=str(work),
+                   capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Demo"], cwd=str(work), capture_output=True)
+    (work / "add.py").write_text("def add(a, b):\n    return a - b\n")
+    subprocess.run(["git", "add", "add.py"], cwd=str(work), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "start"], cwd=str(work), check=True, capture_output=True)
+
+
+def write_fake(bindir, name, body):
+    p = bindir / name
+    p.write_text(body)
+    os.chmod(p, 0o755)
+    return p
+
+
+FIX_FAKE = r'''#!/usr/bin/env python3
+import os, sys
+args = " ".join(sys.argv)
+root = os.environ.get("ALEXUS_HOME", "")
+runid = os.environ.get("ALEXUS_RUN", "")
+d = os.path.join(root, "agents", runid) if root and runid else ""
+if "critic in a proved" in args or "VERDICT:" in args:
+    sys.stdout.write('{"type":"result","is_error":false,"result":"VERDICT: pass"}\n')
+    sys.exit(0)
+npath = os.path.join(d, "fake-legs") if d else ""
+n = 1
+if npath:
+    n = int(open(npath).read() if os.path.exists(npath) else "0") + 1
+    open(npath, "w").write(str(n))
+    os.makedirs(d, exist_ok=True)
+    if not os.path.exists(os.path.join(d, "checklist.frozen")):
+        open(os.path.join(d, "checklist.md"), "w").write(
+            "- [ ] add.py adds 2 and 3 to 5 :: verify: python3 -c \"from add import add; assert add(2,3)==5\"\n")
+if n >= 2:
+    open("add.py", "w").write("def add(a, b):\n    return a + b\n")
+sys.stdout.write('{"type":"system","subtype":"init","session_id":"s","model":"x"}\n')
+sys.stdout.write('{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"add.py"}}]}}\n')
+if n >= 2:
+    sys.stdout.write('{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"add.py","content":"fixed"}}]}}\n')
+sys.stdout.write('{"type":"result","is_error":false,"result":"DONE: claimed the add is right\\nLEFT: nothing","num_turns":1,"session_id":"s"}\n')
+'''
+
+BROKEN_FAKE = r'''#!/usr/bin/env python3
+import os, sys, time
+args = " ".join(sys.argv)
+root = os.environ.get("ALEXUS_HOME", "")
+runid = os.environ.get("ALEXUS_RUN", "")
+d = os.path.join(root, "agents", runid)
+if "critic in a proved" in args:
+    open(os.path.join(d, "critic-started"), "w").close()
+    sys.stdout.write('{"type":"result","is_error":false,"result":"VERDICT: pass"}\n')
+    sys.exit(0)
+p = os.path.join(d, "receipts.jsonl")
+for _ in range(80):
+    if os.path.isfile(p) and os.path.getsize(p) > 0:
+        break
+    time.sleep(0.02)
+if os.path.isfile(p):
+    text = open(p).read()
+    i = text.find('"hash":"')
+    if i >= 0:
+        j = i + 8
+        ch = text[j]
+        text = text[:j] + ("0" if ch != "0" else "1") + text[j+1:]
+        open(p, "w").write(text)
+os.makedirs(d, exist_ok=True)
+open(os.path.join(d, "checklist.md"), "w").write("- [ ] marker :: verify: true\n")
+sys.stdout.write('{"type":"system","subtype":"init","session_id":"s","model":"x"}\n')
+sys.stdout.write('{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"add.py"}}]}}\n')
+sys.stdout.write('{"type":"result","is_error":false,"result":"DONE: claimed\\nLEFT: nothing","num_turns":1,"session_id":"s"}\n')
+'''
+
+GROK_MARK = r'''#!/usr/bin/env python3
+import os, sys
+root = os.environ.get("ALEXUS_HOME", "")
+runid = os.environ.get("ALEXUS_RUN", "")
+d = os.path.join(root, "agents", runid)
+os.makedirs(d, exist_ok=True)
+open(os.path.join(d, "grok-started"), "w").close()
+sys.stdout.write('{"type":"system","subtype":"init","session_id":"g","model":"x"}\n')
+sys.stdout.write('{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"x"}}]}}\n')
+sys.stdout.write('{"type":"result","is_error":false,"result":"DONE: grok\\nLEFT: nothing","num_turns":1,"session_id":"g"}\n')
+'''
+
+
+def main():
+    who = who_arg()
+    base = Path(tempfile.mkdtemp(prefix="alexus-demo-"))
+    home = base / "home"
+    arh = base / "arh"
+    home.mkdir(parents=True, exist_ok=True)
+    arh.mkdir(parents=True, exist_ok=True)
+    work = base / "project"
+    work.mkdir()
+    git_init(work)
+
+    env = os.environ.copy()
+    env["ALEXUS_HOME"] = str(arh)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    for k in list(env):
+        if k.startswith("ALEXUS_") and k != "ALEXUS_HOME":
+            env.pop(k, None)
+    if not REAL:
+        env["HOME"] = str(home)
+        env["ALEXUS_CRITICS"] = "claude"
+    elif not env.get("HOME"):
+        env["HOME"] = os.environ.get("HOME") or str(home)
+
+    bindir = base / "bin"
+    bindir.mkdir()
+    if not REAL:
+        write_fake(bindir, "claude", FIX_FAKE)
+        write_fake(bindir, "grok", GROK_MARK)
+        write_fake(bindir, "codex", "#!/bin/sh\nexit 1\n")
+        env["PATH"] = str(bindir) + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
+        env["ALEXUS_CLAUDE"] = str(bindir / "claude")
+        env["ALEXUS_GROK"] = str(bindir / "grok")
+        env["ALEXUS_CODEX"] = str(bindir / "codex")
+        setup_who = "claude"
+    else:
+        setup_who = who
+        env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin")
+
+    pause("This demo starts in a new folder. add.py has a real bug: it subtracts instead of adding.")
+    r = run_ar(["setup", "--owner", "Ada", "--who", setup_who, "--handoff", "none", "--yes"], env)
+    if r.returncode != 0:
+        die("setup failed: " + (r.stderr or r.stdout or ""))
+
+    pause("A worker will claim the job is done before it has fixed the file. The checklist should fail."
+          if not REAL else
+          "A real %s worker gets the job. The runner checks every checklist line itself before calling it done." % setup_who)
+    start_args = ["start", "--no-plan", "--no-handoff", "--who", setup_who, "--cwd", str(work), "--",
+                  "Fix add.py so add(2, 3) is 5"]
+    r = run_ar(start_args, env, cwd=str(work), timeout=180 if REAL else 60)
+    if r.returncode != 0:
+        die("start failed: " + (r.stderr or r.stdout or ""))
+    rid = (r.stdout or "").strip().splitlines()[-1]
+    wait = 180 if REAL else 60
+    raw_wait = os.environ.get("ALEXUS_DEMO_WAIT")
+    if raw_wait:
+        try:
+            wait = float(raw_wait)
+        except ValueError:
+            pass
+    st = wait_ended(arh, rid, timeout=wait)
+    if not st or not st.get("ended"):
+        die("the first run did not finish")
+    print("The runner sent the worker back when a check failed, then the worker fixed add.py."
+          if not REAL else "The real worker finished.")
+    print("Run %s ended as %s (%s)" % (rid, st.get("verdict") or st.get("status"), st.get("status")))
+    note = st.get("verdict_note") or ""
+    if "could not start" in note:
+        die("run failed to start a CLI: " + note)
+
+    pause("Receipts for this run: each checklist line, DONE or NOT DONE, with the receipt behind it.")
+    rec = run_ar(["receipts", rid], env)
+    sys.stdout.write(rec.stdout or "")
+    if rec.returncode != 0:
+        sys.stdout.write(rec.stderr or "")
+
+    pause("verify should report the chain intact.")
+    v = run_ar(["verify", rid], env)
+    sys.stdout.write(v.stdout or "")
+    if v.returncode != 0:
+        die("verify should have been intact")
+
+    rp = Path(arh) / "agents" / rid / "receipts.jsonl"
+    if st.get("status") in ("starting", "running") or not st.get("ended"):
+        die("refusing to change receipts of a live run")
+    text = rp.read_text(encoding="utf-8")
+    i = text.find('"hash":"')
+    if i < 0:
+        die("no hash in receipts")
+    j = i + 8
+    ch = text[j]
+    flipped = text[:j] + ("0" if ch != "0" else "1") + text[j + 1:]
+    rp.write_text(flipped, encoding="utf-8")
+    pause("One character in one receipt was changed. verify should name the line.")
+    v2 = run_ar(["verify", rid], env)
+    sys.stdout.write(v2.stdout or "")
+    if v2.returncode == 0:
+        die("verify should have failed after the change")
+
+    html_path = base / "receipts.html"
+    # restore the chain so the HTML page can be written from a valid file
+    rp.write_text(text, encoding="utf-8")
+    h = run_ar(["receipts", rid, "--html", str(html_path)], env)
+    if h.returncode != 0 or not html_path.is_file():
+        die("HTML page was not written")
+    print("HTML page: " + str(html_path))
+
+    if REAL:
+        print("Real mode stops after the first story.")
+        return 0
+
+    pause("Second run: the chain is corrupted while the worker is still going.")
+    write_fake(bindir, "claude", BROKEN_FAKE)
+    env["ALEXUS_CLAUDE"] = str(bindir / "claude")
+    work2 = base / "project2"
+    work2.mkdir()
+    git_init(work2)
+    r = run_ar(["setup", "--owner", "Ada", "--who", "claude", "--handoff", "grok", "--yes"], env)
+    if r.returncode != 0:
+        die("second setup failed: " + (r.stderr or r.stdout or ""))
+    r = run_ar(["start", "--no-plan", "--who", "claude", "--handoff", "grok", "--cwd", str(work2), "--",
+                "Fix add.py so add(2, 3) is 5"], env, cwd=str(work2), timeout=60)
+    if r.returncode != 0:
+        die("second start failed: " + (r.stderr or r.stdout or ""))
+    rid2 = (r.stdout or "").strip().splitlines()[-1]
+    st2 = wait_ended(arh, rid2, timeout=60)
+    if not st2:
+        die("the second run did not finish")
+    d2 = Path(arh) / "agents" / rid2
+    print("Second run %s status=%s verdict=%s" % (rid2, st2.get("status"), st2.get("verdict")))
+    if st2.get("verdict") == "chain_broken":
+        print("The run stopped as chain_broken and was never proved.")
+    else:
+        die("expected chain_broken, got %s" % (st2.get("verdict"),))
+    if (d2 / "critic-started").exists() or (d2 / "grok-started").exists() or st2.get("verdict") == "proved":
+        die("critic or handoff started, or the run was proved")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
