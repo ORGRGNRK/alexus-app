@@ -1,6 +1,6 @@
 # Launch posts
 
-Repo link in these: https://github.com/ORGRGNRK/alexus (works once the repo is public).
+Repo link in these: https://github.com/ORGRGNRK/alexus-app (works once the repo is public).
 Attach a screen recording of the demo page, or of `demo/run-demo` in a terminal.
 Only two claims. Don't add more.
 
@@ -18,7 +18,7 @@ Every step is a hash-chained receipt. Edit one character later and it names the 
 
 Works with Claude Code, Grok and Codex. Your own accounts.
 
-github.com/ORGRGNRK/alexus
+github.com/ORGRGNRK/alexus-app
 
 ---
 
@@ -38,7 +38,7 @@ Demo runs with no AI calls: `demo/run-demo`. In it, the AI claims it fixed `add.
 
 It uses your own CLIs and accounts and stores no keys. Early, rough in places, macOS first.
 
-Repo: github.com/ORGRGNRK/alexus
+Repo: github.com/ORGRGNRK/alexus-app
 
 Would love to hear where it breaks for you.
 
@@ -56,7 +56,7 @@ Each run writes a hash-chained receipts.jsonl (prompts and outputs stored as has
 
 macOS first (sandbox-exec, BSD ps). Uses your own CLIs, stores no keys.
 
-https://github.com/ORGRGNRK/alexus
+https://github.com/ORGRGNRK/alexus-app
 
 ---
 
@@ -68,4 +68,4 @@ I built Alexus so I'd stop being the one who checks. It runs the checklist itsel
 
 Don't ship probably. Ship provably.
 
-github.com/ORGRGNRK/alexus
+github.com/ORGRGNRK/alexus-app
