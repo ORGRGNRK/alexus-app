@@ -99,3 +99,9 @@ A stranger can watch the whole loop, with no model calls:
 ```
 demo/run-demo
 ```
+
+## License
+
+Copyright (C) 2026 Christopher Rivera (Ragnarok).
+
+Alexus is free software under the GNU Affero General Public License, version 3 (AGPL-3.0). See [LICENSE](LICENSE). If you run a changed version as a service for other people, you must offer them your source. It comes with no warranty.
