@@ -589,14 +589,17 @@ def ask_one(who, real, prompt, model):
         texts, sess, cost = texts_from_output(r.stdout)
         if not texts:
             return {"ok": False, "who": who, "planner_read_only": read_only, "planner_isolation": isolation,
-                    "error": a.one(r.stderr or r.stdout or f"planner exited {r.returncode}", 600)}
+                    "error": a.feedback_text(r.stderr, r.stdout, r.returncode) or f"planner exited {r.returncode}"}
         text = next((t for t in reversed(texts) if re.search(r"^\s*## Checklist", t, re.M)), texts[-1])
         plan = parse_plan(text)
         # The copy is deleted after this call. A check or wall that names it would be frozen on a dead path.
         for key in ("understood", "will", "wont", "checklist"):
             plan[key] = _strip_copy_path(plan.get(key), work)
         plan["walls"] = [_strip_copy_path(w, work) for w in plan.get("walls") or []]
-        plan.update(who=who, session=sess, cost_usd=cost, raw=text,
+        # cost_usd is the CLI's own figure, priced from tokens. Alexus never sees the bill, so it says so.
+        cost_note = (f"reported by the {who} CLI, priced from tokens; not read from your bill "
+                     f"(check: {who} usage {sess})" if cost is not None else None)
+        plan.update(who=who, session=sess, cost_usd=cost, cost_note=cost_note, raw=text,
                     planner_read_only=read_only, planner_isolation=isolation)
         return plan
     finally:

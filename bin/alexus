@@ -607,6 +607,100 @@ def redact_value(v):
     return v
 
 
+_FEEDBACK_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+FEEDBACK_MAX = 2400
+
+
+def tool_result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                elif isinstance(block.get("content"), str):
+                    parts.append(block["content"])
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def failure_excerpt(text, limit=FEEDBACK_MAX):
+    """The part of a failure worth sending back. A traceback if there is one, otherwise the tail.
+    Newlines stay. The head of a long log is what gets dropped."""
+    text = _FEEDBACK_ANSI.sub("", str(text or "")).replace("\x00", "")
+    if not text.strip():
+        return ""
+    marker = "Traceback (most recent call last):"
+    start = text.rfind(marker)
+    if start != -1:
+        chunk = text[start:]
+    else:
+        chunk = "\n".join(text.splitlines()[-40:])
+    chunk = chunk.strip("\n")
+    raw = chunk.encode("utf-8")
+    if len(raw) <= limit:
+        return chunk
+    return raw[-limit:].decode("utf-8", "ignore").lstrip("\n")
+
+
+def tail_clip(text, limit):
+    """The end of a long failure. The traceback and the assertion live there."""
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    return text[-limit:].lstrip("\n")
+
+
+def prompt_clip(text, limit):
+    """Text pasted into the next model's prompt. A long failure keeps its tail.
+    A long answer keeps its head."""
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    if "Traceback (most recent call last):" in text:
+        return tail_clip(text, limit)
+    return text[:limit]
+
+
+def handoff_summary(text, limit=1200):
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if "Traceback (most recent call last):" in text:
+        return prompt_clip(text, limit)
+    return one(text, limit)
+
+
+def feedback_text(stderr, stdout="", code=None):
+    """Text a later model sees after an error or a failed check. Stderr wins. A traceback keeps its tail."""
+    err = failure_excerpt(stderr)
+    out = failure_excerpt(stdout)
+    if err and "Traceback" not in err and out and "Traceback" in out:
+        body = out
+    else:
+        body = err or out
+    body = (redact_text(body) or "").strip()
+    if body:
+        return body
+    if code is None or code == "":
+        return ""
+    return "exit %s" % code
+
+
+def remember_failure(action, stderr="", stdout="", code=None):
+    """Keep the short error badge, and keep the real stderr for the next prompt."""
+    action["result"] = "error"
+    detail = feedback_text(stderr, stdout, code)
+    if detail:
+        action["detail"] = detail
+
+
 def receipts_path(d):
     return Path(d) / "receipts.jsonl"
 
@@ -1428,7 +1522,15 @@ def apply_muse_event(st, e, tools, ctx):
         if bad:
             st["errors"] += 1
         if k is not None and k < len(st["actions"]):
-            st["actions"][k]["result"] = "error" if bad else "ok"
+            if bad:
+                outcome = rec.get("outcome") or {}
+                remember_failure(
+                    st["actions"][k],
+                    outcome.get("stderr") or outcome.get("message") or outcome.get("error") or "",
+                    outcome.get("output") or outcome.get("stdout") or "",
+                )
+            else:
+                st["actions"][k]["result"] = "ok"
     elif kind == "run_output_delta":
         text = payload.get("text") or ""
         if text:
@@ -1471,8 +1573,16 @@ def apply_codex_event(st, e, tools, ctx):
             elif kind == "item.completed" and iid in tools:
                 action = st["actions"][tools[iid]]
                 failed = item.get("exit_code") not in (None, 0) or item.get("status") in ("failed", "error")
-                action["result"] = "error" if failed else "ok"
-                if failed: st["errors"] += 1
+                if failed:
+                    st["errors"] += 1
+                    remember_failure(
+                        action,
+                        item.get("stderr") or "",
+                        item.get("aggregated_output") or item.get("output") or item.get("stdout") or "",
+                        item.get("exit_code"),
+                    )
+                else:
+                    action["result"] = "ok"
         if kind == "item.completed" and typ == "agent_message":
             note_text(st, ctx, item.get("text") or "")
     elif kind == "turn.completed":
@@ -1480,7 +1590,8 @@ def apply_codex_event(st, e, tools, ctx):
         st.update(final=text or st.get("final") or "Codex finished.", status="done")
     elif kind in ("turn.failed", "error"):
         err = e.get("error") or {}
-        st.update(status="failed", final=one(err.get("message") or e.get("message") or "Codex run failed", 2000))
+        msg = (err.get("message") if isinstance(err, dict) else None) or e.get("message") or ""
+        st.update(status="failed", final=feedback_text(msg) or "Codex run failed")
     if len(st["actions"]) > MAX_ACTIONS:
         drop = len(st["actions"]) - MAX_ACTIONS
         st["actions"] = st["actions"][drop:]
@@ -1527,7 +1638,10 @@ def apply_event(st, e, tools, ctx):
                 if bad:
                     st["errors"] += 1
                 if k is not None and k < len(st["actions"]):
-                    st["actions"][k]["result"] = "error" if bad else "ok"
+                    if bad:
+                        remember_failure(st["actions"][k], c.get("stderr") or "", tool_result_text(c.get("content")))
+                    else:
+                        st["actions"][k]["result"] = "ok"
             elif isinstance(c, dict) and c.get("type") == "text":
                 txt = c.get("text") or ""
                 if any(w in txt.lower() for w in ("hook", "referee", "auditor")) or "📯" in txt or "🟧" in txt:
@@ -1548,7 +1662,14 @@ def apply_event(st, e, tools, ctx):
         if bad:
             st["errors"] += 1
         if k is not None and k < len(st["actions"]):
-            st["actions"][k]["result"] = "error" if bad else "ok"
+            if bad:
+                remember_failure(
+                    st["actions"][k],
+                    e.get("stderr") or e.get("error") or "",
+                    e.get("output") or e.get("stdout") or "",
+                )
+            else:
+                st["actions"][k]["result"] = "ok"
     elif t == "text":
         note_text(st, ctx, e.get("data") or "")
     elif t == "plan" and isinstance(e.get("entries"), list):
@@ -1565,7 +1686,7 @@ def apply_event(st, e, tools, ctx):
                   session=e.get("sessionId") or st.get("session"),
                   status="done" if reason == "end_turn" else "failed")
     elif t == "error":
-        st.update(status="failed", final=one(e.get("message") or "grok error", 2000))
+        st.update(status="failed", final=feedback_text(e.get("message") or "") or "grok error")
     if len(st["actions"]) > MAX_ACTIONS:
         drop = len(st["actions"]) - MAX_ACTIONS
         st["actions"] = st["actions"][drop:]
@@ -1983,24 +2104,36 @@ def run_checks(d, cwd, items, human_approved=False, human_note="", st=None):
                 raw_stdout = r.stdout or b""
                 text_out = raw_stdout.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
                 text_err = (r.stderr or b"").decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
-                out = ANSI_RE.sub("", text_out + text_err).strip()
-                raw_out = out
+                # Colour codes stay out of the expect match. The text sent back on a failure is the stderr tail.
+                combined = ANSI_RE.sub("", text_out + text_err).strip()
+                raw_out = combined
                 ok = r.returncode == 0
                 code = r.returncode
+                bad_expect = None
                 if ok and c["expect"]:
                     try:
-                        ok = re.search(c["expect"], out) is not None
+                        ok = re.search(c["expect"], combined) is not None
                     except re.error:
-                        ok, out = False, f"bad expect regex: {c['expect']}"
-                    if not ok and not out.startswith("bad expect"):
-                        out = f"output did not match {c['expect']!r}: {out}"
-                    if out != raw_out:
-                        raw_out = out
-                c.update(ok=ok, out=one(out, 400) or f"exit {r.returncode}", code=code)
+                        ok, bad_expect = False, f"bad expect regex: {c['expect']}"
+                if bad_expect:
+                    shown = bad_expect
+                elif ok:
+                    shown = one(combined, 400) or f"exit {code}"
+                elif code == 0:
+                    body = feedback_text(text_err, text_out, code)
+                    shown = f"output did not match {c['expect']!r}:\n{body}" if body else f"output did not match {c['expect']!r}"
+                else:
+                    shown = feedback_text(text_err, text_out, code)
+                c.update(ok=ok, out=shown, code=code)
             except subprocess.TimeoutExpired as e:
                 raw_stdout = e.stdout or b""
+                err_b = e.stderr or b""
+                body = feedback_text(
+                    err_b.decode("utf-8", "replace") if isinstance(err_b, bytes) else (err_b or ""),
+                    (raw_stdout.decode("utf-8", "replace") if isinstance(raw_stdout, bytes) else (raw_stdout or "")),
+                )
                 raw_out = f"took longer than {CHECK_TIMEOUT} s"
-                c.update(ok=False, out=raw_out, code=None)
+                c.update(ok=False, out=raw_out + ("\n" + body if body else ""), code=None)
         if st is not None:
             write_receipt(d, st, "check_result", {
                 "claim": redact_text(c.get("claim") or ""),
@@ -2091,8 +2224,10 @@ def _workspace_and_history_context(st, include_human_replies=True):
     if tool_actions:
         lines += ["", "RECENT TOOL ACTIONS IN THIS RUN:"]
         for a in tool_actions[-25:]:
-            res = f" -> {one(a.get('result') or '', 140)}" if a.get("result") else ""
+            res = f" -> {a.get('result')}" if a.get("result") else ""
             lines.append(f"- [{a.get('tool') or 'tool'}] {one(a.get('what') or '', 180)}{res}")
+            if a.get("detail"):
+                lines.append(a["detail"])
     cwd = st.get("cwd")
     if cwd and os.path.isdir(cwd):
         try:
@@ -2143,7 +2278,7 @@ def build_human_resume_prompt(st, prev_req, reply_text, same_session=False):
     lines += _workspace_and_history_context(st, include_human_replies=False)
     prev_final = (st.get("final") or st.get("remark") or st.get("last_good_final") or "").strip()
     if prev_final:
-        lines += ["", f"PREVIOUS AGENT ({st.get('who') or 'claude'}) OUTPUT:", prev_final[:3500]]
+        lines += ["", f"PREVIOUS AGENT ({st.get('who') or 'claude'}) OUTPUT:", prompt_clip(prev_final, 3500)]
     return "\n".join(lines)
 
 
@@ -2206,9 +2341,9 @@ def build_handoff_prompt(st, prev_who, reason):
     prev_final = (st.get("final") or st.get("remark") or "").strip()
     last_good = (st.get("last_good_final") or "").strip()
     if prev_final:
-        lines += ["", f"PREVIOUS PROVIDER ({prev_who}) OUTPUT:", prev_final[:3500]]
+        lines += ["", f"PREVIOUS PROVIDER ({prev_who}) OUTPUT:", prompt_clip(prev_final, 3500)]
     if last_good and last_good != prev_final:
-        lines += ["", "EARLIER SUBSTANTIVE PROVIDER OUTPUT:", last_good[:3000]]
+        lines += ["", "EARLIER SUBSTANTIVE PROVIDER OUTPUT:", prompt_clip(last_good, 3000)]
     fails = [c for c in (st.get("checks") or []) if c.get("ok") is False]
     if fails:
         lines += ["", "FAILED VERIFICATION CHECKS TO FIX:", check_report(fails, only_failed=True)]
@@ -2388,7 +2523,7 @@ def handoff(argv, spawn=True):
         "reason": one(reason, 200),
         "tools": old_st.get("tools") or 0,
         "session": old_st.get("session"),
-        "summary": one(old_st.get("verdict_note") or old_st.get("final") or old_st.get("remark") or old_st.get("last_good_final") or "", 1200),
+        "summary": handoff_summary(old_st.get("verdict_note") or old_st.get("final") or old_st.get("remark") or old_st.get("last_good_final") or ""),
     })
     tried = {h.get("from") for h in prior_handoffs if h.get("from")} | {target_who}
     if handoff_arg is None:
@@ -2410,7 +2545,7 @@ def handoff(argv, spawn=True):
              "handoff_from": old_id, "handoff_chain": chain, "handoffs": prior_handoffs,
              "human_replies": list(old_st.get("human_replies") or []),
              "human_approved": bool(old_st.get("human_approved")),
-             "last_good_final": (last_good or "")[:4000] or None,
+             "last_good_final": prompt_clip(last_good or "", 4000) or None,
              "provider": provider, "model": model,
              "mode": mode, "given_checklist": bool(old_st.get("given_checklist")),
              "domain": old_st.get("domain"),
@@ -2878,9 +3013,14 @@ def evidence_audit(d, st):
             ev_lines.append(f"- human helper reply: {hr.get('reply')}")
     tool_actions = [a for a in (st.get("actions") or []) if isinstance(a, dict) and a.get("kind") == "tool"]
     for a in tool_actions[-100:]:
-        ev_lines.append(f"- tool {a.get('tool')}: {a.get('what')} -> {a.get('result') or 'done'}")
+        line = f"- tool {a.get('tool')}: {a.get('what')} -> {a.get('result') or 'done'}"
+        if a.get("result") == "error" and a.get("detail"):
+            line += "\n" + tail_clip(a.get("detail"), 400)
+        ev_lines.append(line)
     for c in (st.get("checks") or []):
-        ev_lines.append(f"- check '{c.get('claim')}' ({c.get('cmd')}): ok={c.get('ok')} out={one(c.get('out') or '', 250)}")
+        raw_out = c.get("out") or ""
+        clip = tail_clip(raw_out, 400) if c.get("ok") is False else one(raw_out, 250)
+        ev_lines.append(f"- check '{c.get('claim')}' ({c.get('cmd')}): ok={c.get('ok')} out={clip}")
     evidence = "\n".join(ev_lines)[:24000]
     false_flag_re = re.compile(
         r"\bno evidence (is )?needed\b|\bnot a (checkable |factual )+claim\b|"
@@ -2962,7 +3102,13 @@ def run(rid):
         elif st["status"] not in ("done", "failed"):
             st["status"] = "failed"
         if st["status"] == "failed" and not st.get("final"):
-            st["final"] = one(err, 2000) or f"{cur_who} exited {code} without a result"
+            seen = (redact_text(err or "") or "").strip()
+            st["final"] = seen or f"{cur_who} exited {code} without a result"
+        elif st["status"] == "failed":
+            extra = feedback_text(err or "")
+            final = st.get("final") or ""
+            if extra and extra not in final:
+                st["final"] = (final.rstrip() + "\n" + extra).strip()
         st["exit_code"] = code
         # A first leg that touched nothing did no work, whatever it said. Failing it here also sends it to the next provider.
         ck_after = ck.stat().st_mtime if ck.exists() else None
@@ -3104,7 +3250,7 @@ def run(rid):
             "reason": one(reason, 200),
             "tools": st.get("tools") or 0,
             "session": st.get("session"),
-            "summary": one(note or st.get("final") or st.get("remark") or st.get("last_good_final") or "", 1200),
+            "summary": handoff_summary(note or st.get("final") or st.get("remark") or st.get("last_good_final") or ""),
         }
         st.setdefault("handoffs", []).append(handoff_rec)
         st["handoff_chain"] = chain
@@ -3830,6 +3976,46 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
                                                     "- [ ] nocolor :: verify: test \"$NO_COLOR\" = 1 && test -z \"$FORCE_COLOR\"\n"))
     shutil.rmtree(cd, ignore_errors=True)
     check("checks-strip-colour", all(c["ok"] for c in colour))
+    boom = Path(tempfile.mkdtemp(prefix="alexus-stderr-back-"))
+    (boom / "boom.py").write_text(
+        "import sys\n"
+        "print('HEAD-NOISE-XXXX')\n"
+        "sys.stderr.write('Traceback (most recent call last):\\nAssertionError: real value 5\\n')\n"
+        "sys.stderr.write('sk-' + 'ant-' + ('a' * 24) + '\\n')\n"
+        "raise SystemExit(1)\n"
+    )
+    failed = run_checks(boom, str(boom), parse_checklist(
+        "- [ ] boom :: verify: python3 boom.py\n"))
+    shown = failed[0]["out"]
+    report = check_report(failed, True)
+    check("check-failure-sends-stderr",
+          failed[0]["ok"] is False and "AssertionError: real value 5" in shown
+          and "Traceback" in shown and "\n" in shown and "HEAD-NOISE-XXXX" not in shown
+          and "sk-ant-" not in shown and "AssertionError: real value 5" in report)
+    shutil.rmtree(boom, ignore_errors=True)
+    tool_st = {"actions": [], "errors": 0, "who": "claude", "plan": [], "tools": 0, "now": ""}
+    tool_ids = {}
+    noise = "noise-line\n" * 50
+    tool_err = noise + "Traceback (most recent call last):\nAssertionError: from the tool\n"
+    apply_event(tool_st, {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t-err", "name": "Bash", "input": {"command": "python boom.py"}}]}}, tool_ids, {"summary": ""})
+    apply_event(tool_st, {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t-err", "is_error": True, "content": tool_err}]}}, tool_ids, {"summary": ""})
+    detail = tool_st["actions"][-1].get("detail") or ""
+    sent = "\n".join(_workspace_and_history_context(tool_st))
+    check("tool-failure-sends-stderr",
+          tool_st["actions"][-1]["result"] == "error" and "AssertionError: from the tool" in detail
+          and "noise-line" not in detail and "AssertionError: from the tool" in sent)
+    long_final = ("ONLY-AT-THE-HEAD\n" + ("pad-line\n" * 400)
+                  + "Traceback (most recent call last):\nAssertionError: kept on handoff\n")
+    hp = build_handoff_prompt({
+        "task": "fix the crash", "cwd": "/tmp", "plan": [], "handoffs": [], "actions": [],
+        "final": long_final, "status": "failed",
+    }, "claude", "failed")
+    summ = handoff_summary(long_final)
+    check("handoff-keeps-stderr-tail",
+          "AssertionError: kept on handoff" in hp and "ONLY-AT-THE-HEAD" not in hp
+          and "AssertionError: kept on handoff" in summ and "ONLY-AT-THE-HEAD" not in summ)
     check("bookkeeping-not-a-move", r is None and wall_decision(wst, "TaskCreate", {"subject": "rm -rf"}) is None)
     (wd / "state.json").write_text(json.dumps({k: v for k, v in wst.items() if not k.startswith("_")}))
     hk = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "wall-hook", str(wd)], capture_output=True,
